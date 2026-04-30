@@ -92,7 +92,10 @@ def test_result_has_plan_id(binary_Xy):
 def test_binary_metrics_present(binary_Xy):
     profile, X, y = binary_Xy
     results = evaluate_plans([_make_plan()], profile, X, y, cv=3)
-    assert "f1" in results[0].metric_values
+    mv = results[0].metric_values
+    for key in ("f1_macro", "f1_weighted", "accuracy", "balanced_accuracy",
+                "precision_macro", "recall_macro", "mcc", "auc"):
+        assert key in mv, f"missing metric: {key}"
 
 
 def test_multiclass_metrics_present(multiclass_Xy):

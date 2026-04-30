@@ -34,9 +34,17 @@ from typing import List, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
     f1_score,
+    log_loss,
+    matthews_corrcoef,
+    mean_absolute_error,
     mean_squared_error,
+    median_absolute_error,
+    precision_score,
     r2_score,
+    recall_score,
     roc_auc_score,
 )
 from sklearn.model_selection import StratifiedKFold, KFold
@@ -120,27 +128,74 @@ def _evaluate_single(
         if profile.target_type == TargetType.BINARY:
             f1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
             fold_primaries.append(f1)
-            # AUC requires probability estimates; fall back gracefully if unavailable
+
             try:
                 y_prob = fold_pipe.predict_proba(X_val)[:, 1]
                 auc = roc_auc_score(y_val, y_prob)
+                ll  = log_loss(y_val, y_prob)
             except (AttributeError, ValueError):
                 auc = float("nan")
-            fold_metrics.setdefault("f1", []).append(f1)
+                ll  = float("nan")
+
+            fold_metrics.setdefault("f1_macro", []).append(f1)
+            fold_metrics.setdefault("f1_weighted", []).append(
+                f1_score(y_val, y_pred, average="weighted", zero_division=0))
+            fold_metrics.setdefault("precision_macro", []).append(
+                precision_score(y_val, y_pred, average="macro", zero_division=0))
+            fold_metrics.setdefault("recall_macro", []).append(
+                recall_score(y_val, y_pred, average="macro", zero_division=0))
+            fold_metrics.setdefault("accuracy", []).append(
+                accuracy_score(y_val, y_pred))
+            fold_metrics.setdefault("balanced_accuracy", []).append(
+                balanced_accuracy_score(y_val, y_pred))
+            fold_metrics.setdefault("mcc", []).append(
+                matthews_corrcoef(y_val, y_pred))
             fold_metrics.setdefault("auc", []).append(auc)
+            fold_metrics.setdefault("log_loss", []).append(ll)
 
         elif profile.target_type == TargetType.MULTICLASS:
             f1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
             fold_primaries.append(f1)
+
+            try:
+                y_prob = fold_pipe.predict_proba(X_val)
+                auc = roc_auc_score(y_val, y_prob, multi_class="ovr", average="macro")
+                ll  = log_loss(y_val, y_prob)
+            except (AttributeError, ValueError):
+                auc = float("nan")
+                ll  = float("nan")
+
             fold_metrics.setdefault("f1_macro", []).append(f1)
+            fold_metrics.setdefault("f1_weighted", []).append(
+                f1_score(y_val, y_pred, average="weighted", zero_division=0))
+            fold_metrics.setdefault("precision_macro", []).append(
+                precision_score(y_val, y_pred, average="macro", zero_division=0))
+            fold_metrics.setdefault("recall_macro", []).append(
+                recall_score(y_val, y_pred, average="macro", zero_division=0))
+            fold_metrics.setdefault("accuracy", []).append(
+                accuracy_score(y_val, y_pred))
+            fold_metrics.setdefault("balanced_accuracy", []).append(
+                balanced_accuracy_score(y_val, y_pred))
+            fold_metrics.setdefault("mcc", []).append(
+                matthews_corrcoef(y_val, y_pred))
+            fold_metrics.setdefault("auc_ovr", []).append(auc)
+            fold_metrics.setdefault("log_loss", []).append(ll)
 
         else:  # REGRESSION
             rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
-            r2 = float(r2_score(y_val, y_pred))
+            r2   = float(r2_score(y_val, y_pred))
             # Negate RMSE so that higher = better (consistent with other metrics)
             fold_primaries.append(-rmse)
             fold_metrics.setdefault("rmse", []).append(rmse)
+            fold_metrics.setdefault("mae", []).append(
+                float(mean_absolute_error(y_val, y_pred)))
+            fold_metrics.setdefault("median_ae", []).append(
+                float(median_absolute_error(y_val, y_pred)))
             fold_metrics.setdefault("r2", []).append(r2)
+            # MAPE — guard against zero targets
+            with np.errstate(divide="ignore", invalid="ignore"):
+                mape = float(np.nanmean(np.abs((y_val - y_pred) / y_val.replace(0, np.nan))) * 100)
+            fold_metrics.setdefault("mape", []).append(mape)
 
     runtime_secs = time.perf_counter() - t_start
     cv_std = float(np.std(fold_primaries))
