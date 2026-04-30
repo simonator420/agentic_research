@@ -1,11 +1,19 @@
 """
 schemas.py — shared data structures used across all agents.
 
-DataProfile  : output of the Profiler Agent, describes a dataset's structure and statistics.
-Issue        : output of the Issue Detector Agent, describes a single detected problem.
-TargetType   : inferred task type (binary classification / multiclass / regression).
-IssueSeverity: HIGH / MEDIUM / LOW, used by the Planner to prioritise fixes.
-IssueType    : category of a detected problem.
+DataProfile     : output of the Profiler Agent, describes a dataset's structure and statistics.
+Issue           : output of the Issue Detector Agent, describes a single detected problem.
+ActionPlan      : one candidate pipeline configuration proposed by the Planner Agent.
+EvaluationResult: output of the Evaluator Agent for one ActionPlan.
+AttemptRecord   : pairs an ActionPlan with its EvaluationResult for a single iteration;
+                  the full list of AttemptRecords is the within-run memory passed back
+                  to the Planner at each iteration so it never repeats a tried strategy.
+RunResult       : final output of the Orchestrator — best pipeline, plan, full history.
+BaselineResult  : output of a baseline method (rule-based or search-based), in the same
+                  format as RunResult so results can be compared directly.
+TargetType      : inferred task type (binary classification / multiclass / regression).
+IssueSeverity   : HIGH / MEDIUM / LOW, used by the Planner to prioritise fixes.
+IssueType       : category of a detected problem.
 """
 
 from dataclasses import dataclass, field
@@ -95,3 +103,117 @@ class Issue:
     affected_column: Optional[str]  # None for dataset-level issues (e.g. duplicates)
     description: str                # human-readable summary for the LLM prompt
     evidence: Dict[str, Any]        # raw numbers supporting the finding
+
+
+@dataclass
+class ActionPlan:
+    """
+    One candidate pipeline configuration returned by the Planner Agent (via Claude API).
+
+    The Planner produces a list of ActionPlans per iteration; the Executor builds
+    a scikit-learn Pipeline from each one, and the Evaluator picks the best.
+
+    Each field maps directly to a specific sklearn component — no further LLM calls
+    are needed after the Planner returns this structure.
+
+    Valid values per field
+    ----------------------
+    imputation        : "median" | "mean" | "knn" | "iterative"
+    outlier_handling  : "winsorize" | "none"
+    encoding          : "onehot" | "target" | "ordinal"
+    scaling           : "standard" | "robust" | "minmax" | "none"
+    model             : "logistic_regression" | "random_forest" | "gradient_boosting"
+                        | "xgboost" | "lightgbm" | "linear_regression" | "ridge"
+    imbalance_strategy: "class_weight" | "smote" | "none"
+    model_params      : optional dict passed directly to the sklearn estimator constructor
+    """
+    plan_id: str
+    imputation: str
+    outlier_handling: str
+    encoding: str
+    scaling: str
+    model: str
+    imbalance_strategy: str
+    model_params: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class EvaluationResult:
+    """
+    Cross-validated evaluation result for one ActionPlan, produced by the Evaluator Agent.
+
+    score        : composite ranking score (higher = better); used to select the best plan
+                   and as the primary convergence signal for the feedback loop.
+    metric_values: task-appropriate metrics — F1/AUC for classification, RMSE/R² for regression.
+    cv_std       : standard deviation of the primary metric across CV folds; lower = more stable
+                   pipeline (a direct indicator of generalisation consistency).
+    runtime_secs : wall-clock time for the full CV evaluation; used to compare search efficiency
+                   across pipeline configurations.
+    """
+    plan_id: str
+    score: float
+    metric_values: Dict[str, float]  # e.g. {"f1": 0.85, "auc": 0.91} or {"rmse": 12.3, "r2": 0.88}
+    cv_std: float
+    runtime_secs: float
+
+
+@dataclass
+class AttemptRecord:
+    """
+    One entry in the within-run memory: an ActionPlan paired with its EvaluationResult.
+
+    The Orchestrator accumulates these across iterations and passes the full list to
+    propose_action_plans() so the Planner can see which strategies were already tried
+    and what scores they achieved — enabling informed refinement rather than random search.
+    """
+    iteration: int
+    plan: ActionPlan
+    result: EvaluationResult
+
+
+@dataclass
+class RunResult:
+    """
+    Final output of the Orchestrator after a completed run.
+
+    best_pipeline : sklearn Pipeline fitted on the full training set, ready for prediction.
+    best_plan     : the ActionPlan that produced the best cross-validated score.
+    best_result   : the corresponding EvaluationResult (score, metrics, cv_std).
+    history       : all AttemptRecords from every iteration, in chronological order.
+    n_iterations  : number of Planner→Evaluate rounds actually executed.
+    converged     : True if the run stopped because the score threshold was reached;
+                    False if it stopped because max_rounds was exhausted or a plateau
+                    was detected.
+    run_id        : unique identifier for this run, used to query the SQLite store.
+    """
+    best_pipeline: Any          # sklearn Pipeline — typed as Any to avoid importing sklearn here
+    best_plan: ActionPlan
+    best_result: EvaluationResult
+    history: List[AttemptRecord]
+    n_iterations: int
+    converged: bool
+    run_id: str
+
+
+@dataclass
+class BaselineResult:
+    """
+    Output of a baseline method, structured to match RunResult for direct comparison.
+
+    method               : human-readable name, e.g. "rule_based" or "search_based".
+    best_pipeline        : sklearn Pipeline fitted on the full training set.
+    best_plan            : the ActionPlan configuration that was selected or found best.
+    score                : composite evaluation score (same formula as the agentic system).
+    metric_values        : task-appropriate metrics (F1/AUC for classification, RMSE/R² for regression).
+    cv_std               : standard deviation of the primary metric across CV folds.
+    runtime_secs         : total wall-clock time for the baseline run.
+    n_configs_evaluated  : 1 for rule-based (single fixed pipeline); n_trials for search-based.
+    """
+    method: str
+    best_pipeline: Any
+    best_plan: ActionPlan
+    score: float
+    metric_values: Dict[str, float]
+    cv_std: float
+    runtime_secs: float
+    n_configs_evaluated: int

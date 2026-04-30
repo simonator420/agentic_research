@@ -62,8 +62,8 @@ def dataset_fingerprint(profile: DataProfile) -> list:
 
     This vector is stored in ChromaDB and retrieved via cosine similarity to find
     datasets from past runs that are structurally similar to the current one.
-    Similarity lets the Planner warm-start from a previously successful configuration
-    instead of searching from scratch (cross-run memory, H4).
+    When a similar dataset is found, the Planner can warm-start from a previously
+    successful configuration rather than searching from scratch.
 
     Vector layout:
       [0] n_rows             — dataset size

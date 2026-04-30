@@ -1,1 +1,9 @@
 desc.docx
+tests
+.pytest_cache
+src/__pycache__
+__pycache__
+.env
+# database files — generated at runtime, not committed
+storage/runs.db
+storage/chroma_db/
