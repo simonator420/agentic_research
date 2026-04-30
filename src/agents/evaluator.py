@@ -36,6 +36,10 @@ import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
+    brier_score_loss,
+    cohen_kappa_score,
+    confusion_matrix,
+    explained_variance_score,
     f1_score,
     log_loss,
     matthews_corrcoef,
@@ -137,6 +141,16 @@ def _evaluate_single(
                 auc = float("nan")
                 ll  = float("nan")
 
+            # Sensitivity = recall of positive class; specificity = recall of negative class
+            tn, fp, fn, tp = confusion_matrix(y_val, y_pred, labels=sorted(y_val.unique())).ravel()
+            sensitivity = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
+
+            try:
+                brier = brier_score_loss(y_val, y_prob) if not np.isnan(auc) else float("nan")
+            except Exception:
+                brier = float("nan")
+
             fold_metrics.setdefault("f1_macro", []).append(f1)
             fold_metrics.setdefault("f1_weighted", []).append(
                 f1_score(y_val, y_pred, average="weighted", zero_division=0))
@@ -144,14 +158,19 @@ def _evaluate_single(
                 precision_score(y_val, y_pred, average="macro", zero_division=0))
             fold_metrics.setdefault("recall_macro", []).append(
                 recall_score(y_val, y_pred, average="macro", zero_division=0))
+            fold_metrics.setdefault("sensitivity", []).append(sensitivity)
+            fold_metrics.setdefault("specificity", []).append(specificity)
             fold_metrics.setdefault("accuracy", []).append(
                 accuracy_score(y_val, y_pred))
             fold_metrics.setdefault("balanced_accuracy", []).append(
                 balanced_accuracy_score(y_val, y_pred))
             fold_metrics.setdefault("mcc", []).append(
                 matthews_corrcoef(y_val, y_pred))
+            fold_metrics.setdefault("cohen_kappa", []).append(
+                cohen_kappa_score(y_val, y_pred))
             fold_metrics.setdefault("auc", []).append(auc)
             fold_metrics.setdefault("log_loss", []).append(ll)
+            fold_metrics.setdefault("brier_score", []).append(brier)
 
         elif profile.target_type == TargetType.MULTICLASS:
             f1 = f1_score(y_val, y_pred, average="macro", zero_division=0)
@@ -161,9 +180,14 @@ def _evaluate_single(
                 y_prob = fold_pipe.predict_proba(X_val)
                 auc = roc_auc_score(y_val, y_prob, multi_class="ovr", average="macro")
                 ll  = log_loss(y_val, y_prob)
+                brier = float(np.mean([
+                    brier_score_loss((y_val == cls).astype(int), y_prob[:, i])
+                    for i, cls in enumerate(fold_pipe.classes_)
+                ]))
             except (AttributeError, ValueError):
-                auc = float("nan")
-                ll  = float("nan")
+                auc   = float("nan")
+                ll    = float("nan")
+                brier = float("nan")
 
             fold_metrics.setdefault("f1_macro", []).append(f1)
             fold_metrics.setdefault("f1_weighted", []).append(
@@ -178,8 +202,11 @@ def _evaluate_single(
                 balanced_accuracy_score(y_val, y_pred))
             fold_metrics.setdefault("mcc", []).append(
                 matthews_corrcoef(y_val, y_pred))
+            fold_metrics.setdefault("cohen_kappa", []).append(
+                cohen_kappa_score(y_val, y_pred))
             fold_metrics.setdefault("auc_ovr", []).append(auc)
             fold_metrics.setdefault("log_loss", []).append(ll)
+            fold_metrics.setdefault("brier_score", []).append(brier)
 
         else:  # REGRESSION
             rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
@@ -192,9 +219,12 @@ def _evaluate_single(
             fold_metrics.setdefault("median_ae", []).append(
                 float(median_absolute_error(y_val, y_pred)))
             fold_metrics.setdefault("r2", []).append(r2)
+            fold_metrics.setdefault("explained_variance", []).append(
+                float(explained_variance_score(y_val, y_pred)))
             # MAPE — guard against zero targets
             with np.errstate(divide="ignore", invalid="ignore"):
-                mape = float(np.nanmean(np.abs((y_val - y_pred) / y_val.replace(0, np.nan))) * 100)
+                mape = float(np.nanmean(
+                    np.abs((y_val - y_pred) / y_val.replace(0, np.nan))) * 100)
             fold_metrics.setdefault("mape", []).append(mape)
 
     runtime_secs = time.perf_counter() - t_start

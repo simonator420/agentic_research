@@ -94,7 +94,8 @@ def test_binary_metrics_present(binary_Xy):
     results = evaluate_plans([_make_plan()], profile, X, y, cv=3)
     mv = results[0].metric_values
     for key in ("f1_macro", "f1_weighted", "accuracy", "balanced_accuracy",
-                "precision_macro", "recall_macro", "mcc", "auc"):
+                "precision_macro", "recall_macro", "sensitivity", "specificity",
+                "mcc", "cohen_kappa", "auc", "log_loss", "brier_score"):
         assert key in mv, f"missing metric: {key}"
 
 
