@@ -1,19 +1,23 @@
 """
 schemas.py — shared data structures used across all agents.
 
-DataProfile     : output of the Profiler Agent, describes a dataset's structure and statistics.
-Issue           : output of the Issue Detector Agent, describes a single detected problem.
-ActionPlan      : one candidate pipeline configuration proposed by the Planner Agent.
-EvaluationResult: output of the Evaluator Agent for one ActionPlan.
-AttemptRecord   : pairs an ActionPlan with its EvaluationResult for a single iteration;
-                  the full list of AttemptRecords is the within-run memory passed back
-                  to the Planner at each iteration so it never repeats a tried strategy.
-RunResult       : final output of the Orchestrator — best pipeline, plan, full history.
-BaselineResult  : output of a baseline method (rule-based or search-based), in the same
-                  format as RunResult so results can be compared directly.
-TargetType      : inferred task type (binary classification / multiclass / regression).
-IssueSeverity   : HIGH / MEDIUM / LOW, used by the Planner to prioritise fixes.
-IssueType       : category of a detected problem.
+DataProfile          : output of the Profiler Agent, describes a dataset's structure and statistics.
+Issue                : output of the Issue Detector Agent, describes a single detected problem.
+ClarificationQuestion: plain-language question the Issue Detector surfaces for the user
+                       when a data quality issue requires domain knowledge to resolve.
+ClusterResult        : output of the Profiler's exploratory clustering step.
+ActionPlan           : one candidate pipeline configuration proposed by the Planner Agent.
+EvaluationResult     : output of the Evaluator Agent for one ActionPlan.
+AttemptRecord        : pairs an ActionPlan with its EvaluationResult for a single iteration;
+                       the full list of AttemptRecords is the within-run memory passed back
+                       to the Planner at each iteration so it never repeats a tried strategy.
+RunResult            : final output of the Orchestrator — best pipeline, plan, full history,
+                       clarification questions asked, and the plain-language user report.
+BaselineResult       : output of a baseline method (rule-based or search-based), in the same
+                       format as RunResult so results can be compared directly.
+TargetType           : inferred task type (binary classification / multiclass / regression).
+IssueSeverity        : HIGH / MEDIUM / LOW, used by the Planner to prioritise fixes.
+IssueType            : category of a detected problem.
 """
 
 from dataclasses import dataclass, field
@@ -43,6 +47,56 @@ class IssueType(str, Enum):
     NOISY_CATEGORIES = "noisy_categories"   # very high cardinality — likely ID or free-text
     LEAKAGE_CANDIDATE = "leakage_candidate" # feature correlates suspiciously well with target
     CLASS_IMBALANCE = "class_imbalance"
+
+
+@dataclass
+class ClarificationQuestion:
+    """
+    A plain-language question surfaced by the Issue Detector when a data quality issue
+    cannot be resolved without domain knowledge (e.g. whether a column represents a
+    pre-event or post-event measurement in a sports context).
+
+    The system batches all questions and interrupts the user at most once per run.
+    The user's answer is stored in the `answer` field and passed to the Planner Agent
+    so it can make an informed preprocessing decision.
+    """
+    question_id: str
+    question: str                # plain-language question for the non-technical user
+    affected_column: Optional[str]
+    issue_type: str              # IssueType.value string
+    answer: Optional[str] = None # filled in after the user responds; None = not yet asked
+
+
+@dataclass
+class ClusterResult:
+    """
+    Output of the Profiler Agent's exploratory clustering step.
+
+    Clustering is run on numeric features only, using k-means with the number of
+    clusters selected by silhouette score. Each cluster is summarised as a
+    plain-language description (e.g. "high minutes_played, low injury_count")
+    so that non-technical sports users can interpret the natural groupings.
+
+    Attributes
+    ----------
+    n_clusters         : number of clusters selected by silhouette optimisation.
+    labels             : cluster assignment for each row in valid_indices.
+    valid_indices      : original DataFrame indices that were clustered
+                         (rows with NaN in any numeric column are excluded).
+    numeric_columns    : columns used for clustering.
+    silhouette_score   : average silhouette coefficient (higher = better separation).
+    davies_bouldin_index: Davies–Bouldin index (lower = better separation).
+    cluster_summaries  : {cluster_id: plain-language description}.
+    method             : clustering algorithm used ("kmeans" | "hierarchical" | "dbscan").
+    """
+    n_clusters: int
+    labels: List[int]
+    valid_indices: List[int]
+    numeric_columns: List[str]
+    silhouette_score: float
+    davies_bouldin_index: float
+    cluster_summaries: Dict[int, str]
+    method: str
 
 
 @dataclass
@@ -88,6 +142,8 @@ class DataProfile:
     columns: Dict[str, ColumnProfile]               # keyed by column name
     n_duplicates: int
     fingerprint: List[float] = field(default_factory=list)  # filled by dataset_fingerprint()
+    clusters: Optional[ClusterResult] = None        # filled by discover_clusters() + summarize_patterns()
+    sports_context: Optional[Any] = None            # SportsContext from sports_vocabulary.detect_sports_context()
 
 
 @dataclass
@@ -193,6 +249,8 @@ class RunResult:
     n_iterations: int
     converged: bool
     run_id: str
+    clarification_questions: List[ClarificationQuestion] = field(default_factory=list)
+    user_report: str = ""       # plain-language markdown report for non-technical sports users
 
 
 @dataclass

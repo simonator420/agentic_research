@@ -140,10 +140,13 @@ def _get_model(plan: ActionPlan, target_type: TargetType) -> BaseEstimator:
     target_type so the Planner only needs to name the model family.
     class_weight="balanced" is injected for models that support it when
     imbalance_strategy == "class_weight".
+
+    Keys starting with "__" (e.g. "__explanation") are internal metadata stored
+    by the Planner and are stripped before passing params to the sklearn constructor.
     """
     is_regression = target_type == TargetType.REGRESSION
     use_class_weight = plan.imbalance_strategy == "class_weight"
-    params = dict(plan.model_params)
+    params = {k: v for k, v in plan.model_params.items() if not k.startswith("__")}
 
     if plan.model == "logistic_regression":
         if use_class_weight:

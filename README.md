@@ -1,9 +1,25 @@
-# Agentic AutoML — Project Guide
+# Agentic AI for Sports Analytics
 
-Autonomous ML pipeline optimisation system using Claude as the Planner Agent.
-The system profiles a tabular dataset, detects data quality issues, and iteratively
-proposes and evaluates preprocessing + model configurations until a strong pipeline
-is found.
+An autonomous machine learning pipeline optimisation system designed for
+**non-technical sports users** — coaches, performance analysts, scouts, and
+federation staff.
+
+The system profiles a sports dataset, detects data quality issues specific to
+sports data (post-match leakage, playing-time missingness, identity columns),
+asks the user plain-language clarification questions, and then iteratively
+proposes and evaluates preprocessing + model configurations using
+[Claude](https://www.anthropic.com/claude) as the reasoning agent.
+
+---
+
+## What it does
+
+1. **Profiles the dataset** — column types, missing values, outliers, class imbalance, duplicates
+2. **Detects sports domain** — recognises column names from StatsBomb, Wyscout, Opta, NBA API, Sofascore (e.g. `xG`, `MP`, `playerID`, `teamName`, `minutes_played`)
+3. **Runs exploratory clustering** — surfaces natural groupings (player archetypes, match intensity tiers) before any predictive modelling
+4. **Asks clarification questions** — e.g. "Is `goals_scored` recorded before or after the match you want to predict?"
+5. **Optimises a scikit-learn pipeline** — the Claude-powered Planner proposes configurations; the Evaluator tests them via cross-validation; the loop refines until convergence
+6. **Generates a plain-language report** — with visualisations (feature importance, confusion matrix, cluster projection) written for a non-technical sports audience
 
 ---
 
@@ -15,26 +31,46 @@ is found.
 pip install -r requirements.txt
 ```
 
-### 2. Add your Anthropic API key
+### 2. Set your Anthropic API key
 
-Create a `.env` file in the project root (already listed in `.gitignore`):
+Create a `.env` file in the project root (already listed in `.gitignore` — it will never be committed):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-### 3. Add your dataset
+Or export it as an environment variable:
 
-Place any CSV file in the `data/` folder. A sample `titanic.csv` is included.
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
 
-### 4. Open the notebook and run
+### 3. Run the Streamlit app
+
+```bash
+streamlit run app.py
+```
+
+The browser opens at `http://localhost:8501`. Upload any CSV, pick the target column, answer the clarification questions, and click **Run Agentic Pipeline**.
+
+### 4. Or use the notebook
 
 ```bash
 jupyter notebook experiments.ipynb
 ```
 
-Run cells top to bottom. Change `DATA_PATH` and `TARGET` in cell 4 to point at
-your dataset.
+Run cells top to bottom. The demo uses `data/titanic.csv`. For real sports data, change `DATA_PATH` and `TARGET` in cell 4.
+
+---
+
+## Recommended sports datasets
+
+| Dataset | Link | Suggested target |
+|---------|------|-----------------|
+| StatsBomb Open Data | [github.com/statsbomb/open-data](https://github.com/statsbomb/open-data) | shot outcome |
+| NBA shot logs | [Kaggle](https://www.kaggle.com/dansbecker/nba-shot-logs) | shot_made_flag |
+| FIFA player attributes | [Kaggle](https://www.kaggle.com/stefanoleone992/fifa-22-complete-player-dataset) | overall_rating |
+| Injury/wellness data | [Kaggle](https://www.kaggle.com/search?q=sports+injury+dataset) | injured |
 
 ---
 
@@ -43,42 +79,46 @@ your dataset.
 ```
 agentic_research/
 │
-├── experiments.ipynb          ← main entry point (run this)
+├── app.py                         ← Streamlit web interface (run this)
+├── experiments.ipynb              ← Jupyter notebook (full pipeline + ablation study)
 ├── requirements.txt
-├── .env                       ← API key (not committed)
+├── .env                           ← API key (NOT committed — create this yourself)
 │
-├── data/                      ← put your CSV datasets here
-│   └── titanic.csv
+├── data/
+│   └── titanic.csv                ← demo dataset (60 KB)
 │
-├── storage/                   ← auto-created at runtime
-│   ├── runs.db                ← SQLite: within-run attempt history
-│   └── chroma_db/             ← ChromaDB: cross-run memory
+├── storage/                       ← auto-created at runtime
+│   ├── runs.db                    ← SQLite: within-run attempt history
+│   └── chroma_db/                 ← ChromaDB: cross-run memory
+│
+├── figures/                       ← auto-created: PNGs of charts and visualisations
 │
 ├── src/
 │   ├── models/
-│   │   └── schemas.py         ← all shared dataclasses (ActionPlan, RunResult, …)
+│   │   └── schemas.py             ← shared dataclasses (ActionPlan, RunResult, …)
 │   │
 │   ├── data/
-│   │   └── loader.py          ← load_data(), split_data(), dataset_fingerprint()
+│   │   └── loader.py              ← load_data(), split_data(), dataset_fingerprint()
 │   │
 │   ├── agents/
-│   │   ├── profiler.py        ← Step 1: generate DataProfile from a DataFrame
-│   │   ├── issue_detector.py  ← Step 2: detect data quality issues (missingness, outliers, …)
-│   │   ├── planner.py         ← Step 3: call Claude API → propose ActionPlans
-│   │   ├── executor.py        ← Step 4: build sklearn Pipeline from an ActionPlan
-│   │   └── evaluator.py       ← Step 5: cross-validate pipelines, pick the best
+│   │   ├── profiler.py            ← Step 1: DataProfile + exploratory clustering
+│   │   ├── sports_vocabulary.py   ← sports domain detection (synonym groups, abbreviation expansion)
+│   │   ├── issue_detector.py      ← Step 2: detect quality issues + clarification questions
+│   │   ├── planner.py             ← Step 3: Claude API → propose ActionPlans
+│   │   ├── executor.py            ← Step 4: build sklearn Pipeline from ActionPlan
+│   │   └── evaluator.py           ← Step 5: cross-validate, visualise, build user report
 │   │
 │   ├── memory/
-│   │   ├── run_store.py       ← SQLite store — saves every attempt within a run
-│   │   └── vector_store.py    ← ChromaDB store — saves best plans across runs
+│   │   ├── run_store.py           ← SQLite store (within-run history)
+│   │   └── vector_store.py        ← ChromaDB store (cross-run warm-start memory)
 │   │
 │   ├── baselines/
-│   │   ├── rule_based.py      ← static heuristic pipeline (no LLM, no search)
-│   │   └── search_based.py    ← Optuna TPE random search (no LLM, no feedback)
+│   │   ├── rule_based.py          ← static heuristic pipeline (no LLM)
+│   │   └── search_based.py        ← Optuna TPE random search (no LLM)
 │   │
-│   └── orchestrator.py        ← ties everything together; call run_agentic_pipeline()
+│   └── orchestrator.py            ← ties everything together; run_agentic_pipeline()
 │
-└── tests/                     ← pytest unit tests for every module
+└── tests/                         ← 147 pytest tests (all pass without an API key)
     ├── test_profiler.py
     ├── test_issue_detector.py
     ├── test_planner.py
@@ -95,131 +135,120 @@ agentic_research/
 ## How the agentic loop works
 
 ```
-Dataset
+Dataset (CSV)
   │
   ▼
-Profiler ──────────────────────────────────────────────────────────────┐
-  │  DataProfile (shape, dtypes, stats, class distribution)            │
-  ▼                                                                     │
-Issue Detector                                                          │
-  │  List[Issue] (missingness / outliers / imbalance / leakage / …)    │
-  ▼                                                                     │
-┌─────────────────────────────────────────────────────────────────┐    │
-│  Agentic loop  (max_rounds iterations)                          │    │
-│                                                                 │    │
-│  Planner (Claude API) ◄── history of past attempts             │    │
-│      │                ◄── cross-run memory (ChromaDB)          │    │
-│      │  List[ActionPlan]                                        │    │
-│      ▼                                                          │    │
-│  Executor  →  sklearn Pipeline (per plan)                       │    │
-│      ▼                                                          │    │
-│  Evaluator →  cross-validation → composite score               │    │
-│      │                                                          │    │
-│      └── best plan saved to SQLite + fed back to Planner ──────┘    │
-└─────────────────────────────────────────────────────────────────┘    │
-  │                                                                     │
-  ▼                                                                     │
-Best pipeline re-fitted on full training set                           │
-Best plan stored in ChromaDB (warm-start for next run) ◄──────────────┘
+Profiler ──────────────────────────────────────────────────────────────────┐
+  │  DataProfile + sports domain detection + cluster patterns              │
+  ▼                                                                         │
+Issue Detector                                                              │
+  │  List[Issue]  +  clarification questions for the user                  │
+  ▼                                                                         │
+User answers clarification questions  (Streamlit UI or terminal)           │
+  │                                                                         │
+  ▼                                                                         │
+┌─────────────────────────────────────────────────────────────────────┐    │
+│  Agentic loop  (max_rounds iterations)                              │    │
+│                                                                     │    │
+│  Planner (Claude API) ◄── attempt history + user answers           │    │
+│      │                ◄── cross-run memory (ChromaDB)              │    │
+│      │  List[ActionPlan]  with plain-language explanations         │    │
+│      ▼                                                              │    │
+│  Executor  →  scikit-learn Pipeline (one per plan)                  │    │
+│      ▼                                                              │    │
+│  Evaluator →  cross-validation → composite score                   │    │
+│      │                                                              │    │
+│      └── best plan saved to SQLite + fed back to Planner ──────────┘    │
+└─────────────────────────────────────────────────────────────────────┘    │
+  │                                                                         │
+  ▼                                                                         │
+Best pipeline re-fitted on full training set                               │
+Best plan stored in ChromaDB (warm-start for next run) ◄───────────────────┘
   │
   ▼
-RunResult  (best_pipeline, best_plan, metric_values, history, …)
+RunResult  +  plain-language report  +  visualisations
 ```
 
-**Stopping criteria** (checked after every round):
-- `score_threshold` reached → `converged = True`, stop immediately
+**Stopping criteria:**
+- `score_threshold` reached → converged, stop immediately
 - No improvement for 2 consecutive rounds (plateau) → stop early
-- `max_rounds` exhausted → stop, `converged = False`
+- `max_rounds` exhausted → stop
 
 ---
 
-## Notebook sections
+## Sports domain detection
 
-| Cell | Section | What it does |
-|------|---------|--------------|
-| 1 | Setup | Adds project root to `sys.path`, loads `.env` |
-| 2 | Imports | Loads all public functions |
-| 4 | Load dataset | Reads CSV, shows shape and first rows |
-| 6 | Profile & issues | Prints detected data quality issues |
-| 8 | Run agentic pipeline | Runs the full optimisation loop |
-| 10 | Results | Prints best plan, score, metrics |
-| 12 | Iteration history | DataFrame of all tried configurations |
-| 14 | Predict | Runs best pipeline on the test split |
-| 16 | Inspect SQLite | Lists all stored runs and their scores |
-| 18–25 | **Ablation study** | Runs all comparison variants (see below) |
+The `sports_vocabulary` module normalises column names and matches them against
+synonym groups organised by domain:
+
+| Category | Examples detected |
+|----------|------------------|
+| Performance / post-match | `goals_scored`, `xG`, `xga`, `possession`, `PTS`, `REB` |
+| Playing time | `minutes_played`, `MP`, `appearances`, `starts` |
+| Injury / wellness | `injury_status`, `return_to_play`, `wellness_score`, `hrv` |
+| Identity columns | `player_id`, `teamName`, `match_id`, `playerID` |
+| Physical attributes | `height`, `weight`, `sprint_speed`, `vo2max` |
+| Workload metrics | `training_load`, `ACWR`, `session_rpe`, `HSR` |
+
+Abbreviation expansion handles provider-specific shorthand:
+`xG → expected goals`, `MP → minutes played`, `PTS → points`, `AST → assists`
+
+Confidence thresholds:
+- ≥ 5% of columns matched → **sports** (apply full sports logic)
+- 2–5% → **possible_sports** (ask user to confirm)
+- < 2% → **general_tabular** (run without sports-specific warnings)
 
 ---
 
-## Ablation study (notebook section 8)
+## Ablation study
 
-Five variants are run on the same dataset and compared in a summary table:
+Five variants run on the same dataset for comparison:
 
-| # | Variant | How it's run |
-|---|---------|--------------|
-| 1 | Rule-based baseline | `run_rule_based(df, TARGET)` |
-| 2 | Search-based baseline (Optuna) | `run_search_based(df, TARGET, n_trials=50)` |
+| # | Variant | Code |
+|---|---------|------|
+| 1 | Rule-based baseline | `run_rule_based(df, target)` |
+| 2 | Search-based baseline (Optuna, 50 trials) | `run_search_based(df, target, n_trials=50)` |
 | 3 | Agentic — no memory | `run_agentic_pipeline(..., use_memory=False)` |
 | 4 | Agentic — no feedback loop | `run_agentic_pipeline(..., max_rounds=1)` |
-| 5 | Warm-start experiment | Run full pipeline twice in sequence; compare `n_iterations` |
-| 6 | Full agentic system | `run_agentic_pipeline(...)` (default settings) |
-
-The final cell produces a summary DataFrame sorted by composite score.
+| 5 | Warm-start experiment | Two sequential runs; compare `n_iterations` |
+| 6 | Full agentic system | `run_agentic_pipeline(...)` |
 
 ---
 
-## Key parameters of `run_agentic_pipeline`
+## Key parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_rounds` | `3` | Maximum Planner → Evaluate iterations |
-| `n_plans_per_round` | `3` | Candidate pipelines proposed per round |
+| `n_plans_per_round` | `3` | Candidate pipelines per round |
 | `cv` | `5` | Cross-validation folds |
-| `score_threshold` | `0.90` | Early-stop when this composite score is reached |
-| `use_memory` | `True` | Set `False` to disable ChromaDB (ablation variant 3) |
-| `verbose` | `True` | Print round-by-round progress |
-| `random_state` | `42` | Seed for reproducible train/test splits |
+| `score_threshold` | `0.90` | Early-stop threshold |
+| `use_memory` | `True` | Disable ChromaDB for ablation |
+| `ask_clarifications` | `True` | Collect user answers via terminal |
+| `prefilled_questions` | `None` | Pre-answered questions from Streamlit UI |
 
 ---
 
 ## Composite score formula
 
-All variants use the same formula so results are directly comparable:
+Used by all variants for direct comparison:
 
 ```
 score = primary_metric − 0.5 × cv_std − 0.01 × n_pipeline_steps
 ```
 
-- `primary_metric`: F1 (binary/multiclass) or −RMSE (regression) — higher is always better
-- `cv_std`: standard deviation across CV folds (penalises instability)
-- `n_pipeline_steps`: number of steps in the sklearn Pipeline (penalises unnecessary complexity)
+- `primary_metric`: F1 (classification) or −RMSE (regression) — higher is always better
+- `cv_std`: standard deviation across folds (penalises instability)
+- `n_pipeline_steps`: number of Pipeline steps (penalises unnecessary complexity)
 
 ---
 
 ## Running the tests
 
 ```bash
-# Run all tests
-pytest
-
-# Run a specific module
+pytest                              # all 147 tests
 pytest tests/test_orchestrator.py -v
-
-# Run just baseline tests
 pytest tests/test_baselines.py -v
 ```
 
-All 147 tests should pass without an API key — the Planner (Claude) is mocked
-in the orchestrator and planner tests.
-
----
-
-## Storage files
-
-| File | Purpose | Created by |
-|------|---------|------------|
-| `storage/runs.db` | SQLite database; every `AttemptRecord` from every run | Orchestrator (auto) |
-| `storage/chroma_db/` | ChromaDB vector store; best plans indexed by dataset fingerprint | Orchestrator (auto) |
-
-Both paths are fixed relative to the project root regardless of where you launch
-the notebook from. To start fresh, delete these files — they will be recreated
-on the next run.
+All tests pass without an API key — the Planner (Claude) is mocked in the relevant tests.

@@ -7,6 +7,13 @@ returns a list of Issue objects, each with a severity score (HIGH / MEDIUM / LOW
 The list is sorted HIGH → LOW so the Planner Agent processes the most critical
 problems first when constructing ActionPlans.
 
+For issues that cannot be resolved automatically without domain knowledge — such
+as whether a column records a pre-event or post-event measurement, or whether
+missing values mean "did not play" vs "data unavailable" — the module also
+provides request_user_clarification(), which formulates a small set of plain-
+language questions for the non-technical sports user.  All questions are batched
+(at most 4 per run) so the system interrupts the user at most once.
+
 Detected issue types
 --------------------
 HIGH_MISSINGNESS   : column has too many NaN values to ignore.
@@ -18,14 +25,29 @@ CLASS_IMBALANCE    : minority class is underrepresented in a classification targ
 
 Public API
 ----------
-detect_issues(profile, df) -> List[Issue]
+detect_issues(profile, df)              -> List[Issue]
+request_user_clarification(issues, profile) -> List[ClarificationQuestion]
 """
 
+import uuid
 from typing import List
 
 import pandas as pd
 
-from src.models.schemas import DataProfile, Issue, IssueSeverity, IssueType, TargetType
+from src.agents.sports_vocabulary import (
+    get_cardinality_question,
+    get_domain_question,
+    get_leakage_question,
+    get_missingness_question,
+)
+from src.models.schemas import (
+    ClarificationQuestion,
+    DataProfile,
+    Issue,
+    IssueSeverity,
+    IssueType,
+    TargetType,
+)
 
 # --- Severity thresholds for missing values ---
 # >30 % missing → HIGH (likely needs dropping or heavy imputation)
@@ -274,3 +296,107 @@ def detect_issues(profile: DataProfile, df: pd.DataFrame) -> List[Issue]:
     issues.extend(_imbalance_issues(profile))
     issues.sort(key=lambda i: _SEVERITY_ORDER[i.severity])
     return issues
+
+
+def request_user_clarification(
+    issues: List[Issue],
+    profile: DataProfile,
+) -> List[ClarificationQuestion]:
+    """
+    Formulate plain-language clarification questions for ambiguous high-severity issues.
+
+    Only issues that genuinely require domain knowledge to resolve are turned into
+    questions — e.g. whether a leakage-candidate column records a pre-event or
+    post-event measurement, or whether a large block of missing values means the
+    athlete did not play vs the data was not collected.
+
+    Questions are capped at 4 per run and batched so the user is interrupted at
+    most once.  If no clarification is critical the function returns an empty list
+    and the system proceeds autonomously.
+
+    Parameters
+    ----------
+    issues  : severity-sorted issue list from detect_issues().
+    profile : DataProfile for column names and target information.
+
+    Returns
+    -------
+    List[ClarificationQuestion] (at most 4 items).
+    """
+    questions: List[ClarificationQuestion] = []
+
+    # If the domain is ambiguous (some sports signals but below confident threshold),
+    # ask the user to confirm before applying sports-specific logic.
+    if getattr(profile, "sports_context", None) is not None:
+        domain_q = get_domain_question(profile.sports_context)
+        if domain_q:
+            questions.append(ClarificationQuestion(
+                question_id=uuid.uuid4().hex[:8],
+                question=domain_q,
+                affected_column=None,
+                issue_type="domain_confirmation",
+            ))
+
+    for issue in issues:
+        if issue.severity != IssueSeverity.HIGH:
+            continue
+
+        if issue.issue_type == IssueType.LEAKAGE_CANDIDATE and issue.affected_column:
+            corr = issue.evidence.get("correlation", 0.0)
+            # Prefer sports-specific question if the column name matches a known post-match stat.
+            sports_q = get_leakage_question(issue.affected_column)
+            question_text = sports_q if sports_q else (
+                f"Column '{issue.affected_column}' is very strongly correlated with the "
+                f"target '{profile.target_column}' (|r| = {corr:.3f}). "
+                f"Is this value recorded BEFORE the event or outcome you are predicting, "
+                f"or AFTER it? If it is recorded after (e.g. final score used to predict "
+                f"match result), it must be excluded to prevent data leakage."
+            )
+            questions.append(ClarificationQuestion(
+                question_id=uuid.uuid4().hex[:8],
+                question=question_text,
+                affected_column=issue.affected_column,
+                issue_type=issue.issue_type.value,
+            ))
+
+        elif issue.issue_type == IssueType.NOISY_CATEGORIES and issue.affected_column:
+            n_unique = issue.evidence.get("n_unique", "many")
+            ratio = issue.evidence.get("cardinality_ratio", 0.0)
+            # Prefer sports-specific question for known identity column patterns.
+            sports_q = get_cardinality_question(issue.affected_column)
+            question_text = sports_q if sports_q else (
+                f"Column '{issue.affected_column}' has {n_unique} unique values "
+                f"({ratio:.1%} of rows). Should these be grouped into broader categories "
+                f"(e.g. injury types grouped into 'muscle', 'joint', 'other'), or is each "
+                f"value meaningful on its own? If this column contains player names, match "
+                f"IDs, or other identifiers, it should be excluded from the model."
+            )
+            questions.append(ClarificationQuestion(
+                question_id=uuid.uuid4().hex[:8],
+                question=question_text,
+                affected_column=issue.affected_column,
+                issue_type=issue.issue_type.value,
+            ))
+
+        elif issue.issue_type == IssueType.HIGH_MISSINGNESS and issue.affected_column:
+            missing_rate = issue.evidence.get("missing_rate", 0.0)
+            if missing_rate > 0.40:
+                # Prefer sports-specific question for playing-time / injury columns.
+                sports_q = get_missingness_question(issue.affected_column)
+                question_text = sports_q if sports_q else (
+                    f"Column '{issue.affected_column}' has {missing_rate:.1%} missing values. "
+                    f"Does a missing value here mean the athlete or team did NOT participate "
+                    f"(e.g. did not play, was not selected), or is the data simply unavailable "
+                    f"for administrative reasons? The answer affects how missing values are handled."
+                )
+                questions.append(ClarificationQuestion(
+                    question_id=uuid.uuid4().hex[:8],
+                    question=question_text,
+                    affected_column=issue.affected_column,
+                    issue_type=issue.issue_type.value,
+                ))
+
+        if len(questions) >= 4:
+            break
+
+    return questions
