@@ -201,7 +201,7 @@ st.caption(
 )
 
 # ── Session state ─────────────────────────────────────────────────────────────
-_STATE_KEYS = ("df", "df_prepared", "goal_text", "task_spec", "target",
+_STATE_KEYS = ("df", "df_prepared", "dataset_name", "goal_text", "task_spec", "target",
                "preflighted", "profile", "issues", "questions",
                "prep_report", "result")
 for _k in _STATE_KEYS:
@@ -243,9 +243,18 @@ if df is None:
     st.info("Upload a CSV file or choose a demo dataset to get started.")
     st.stop()
 
+# Derive a human-readable dataset name for the export CSV
+if uploaded is not None:
+    _dataset_name = Path(uploaded.name).stem
+elif demo_choice != "— upload my own —":
+    _dataset_name = Path(demo_choice).stem
+else:
+    _dataset_name = "unknown"
+
 if st.session_state.df is not None and not df.equals(st.session_state.df):
     _reset_from("task_spec")
 st.session_state.df = df
+st.session_state.dataset_name = _dataset_name
 
 st.success(f"Loaded **{len(df):,} rows × {len(df.columns)} columns**")
 with st.expander("Preview — first 10 rows"):
@@ -630,21 +639,24 @@ _VIS_META = {
 
 
 def _render_visualisations(figures_dir: str) -> None:
-    """Display all PNGs in figures_dir as a labelled, full-width gallery."""
+    """Display all PNGs in figures_dir as a 2-column grid with titles and captions."""
     fig_files = sorted(Path(figures_dir).glob("*.png"))
     if not fig_files:
         st.info("No visualisations were generated for this run.")
         return
-    for fig_path in fig_files:
-        stem = fig_path.stem
-        title, description = _VIS_META.get(
-            stem, (stem.replace("_", " ").title(), "")
-        )
-        st.markdown(f"#### {title}")
-        if description:
-            st.caption(description)
-        st.image(str(fig_path), use_container_width=True)
-        st.divider()
+    pairs = [fig_files[i:i + 2] for i in range(0, len(fig_files), 2)]
+    for pair in pairs:
+        cols = st.columns(2)
+        for col, fig_path in zip(cols, pair):
+            stem = fig_path.stem
+            title, description = _VIS_META.get(
+                stem, (stem.replace("_", " ").title(), "")
+            )
+            with col:
+                st.markdown(f"**{title}**")
+                if description:
+                    st.caption(description)
+                st.image(str(fig_path), use_container_width=True)
 
 
 if isinstance(result, _ExploratoryResult):
@@ -767,3 +779,118 @@ else:
                 **extra,
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESEARCH EXPORT — one-row CSV for the results table
+# ─────────────────────────────────────────────────────────────────────────────
+st.divider()
+st.subheader("Step 7 — Export run summary")
+st.caption(
+    "Download a single-row CSV you can paste into your research results table. "
+    "Fill in the 'makes_sense' column manually after reviewing the results."
+)
+
+def _build_export_row() -> pd.DataFrame:
+    """Assemble one research-table row from current session state."""
+    import datetime
+
+    _profile  = st.session_state.get("profile")
+    _issues   = st.session_state.get("issues") or []
+    _result   = st.session_state.get("result")
+    _dname    = st.session_state.get("dataset_name") or "unknown"
+    _raw_df   = st.session_state.get("df")
+
+    row: dict = {"dataset_name": _dname}
+
+    # ── Dataset properties ────────────────────────────────────────────────
+    if _profile:
+        row["task_type"]      = _profile.target_type.value if hasattr(_profile.target_type, "value") else str(_profile.target_type)
+        row["target_variable"] = _profile.target_column or ""
+        row["n_rows"]         = _profile.n_rows
+        row["n_cols"]         = _profile.n_cols
+        # Average missingness across feature columns
+        miss_rates = [c.missing_rate for c in _profile.columns.values()]
+        row["avg_missingness"] = round(float(sum(miss_rates) / len(miss_rates)), 4) if miss_rates else 0.0
+        row["max_missingness"] = round(max(miss_rates), 4) if miss_rates else 0.0
+    else:
+        row.update({"task_type": "", "target_variable": "", "n_rows": "",
+                    "n_cols": "", "avg_missingness": "", "max_missingness": ""})
+
+    # ── Issues ────────────────────────────────────────────────────────────
+    row["n_issues"]      = len(_issues)
+    row["n_high_issues"] = sum(1 for i in _issues if i.severity.value == "high")
+
+    # ── Exploratory result ────────────────────────────────────────────────
+    from src.models.schemas import ExploratoryResult as _ER
+    if isinstance(_result, _ER):
+        row.update({
+            "model": "exploratory", "imputation": "", "encoding": "",
+            "scaling": "", "outlier_handling": "", "imbalance_strategy": "",
+            "composite_score": "", "cv_std": "",
+            "n_iterations": 1, "converged": "",
+        })
+        for k in ["r2", "rmse", "mae", "f1_macro", "auc", "mape"]:
+            row[k] = ""
+    elif _result is not None:
+        plan = _result.best_plan
+        res  = _result.best_result
+        row["model"]               = plan.model
+        row["imputation"]          = plan.imputation
+        row["encoding"]            = plan.encoding
+        row["scaling"]             = plan.scaling
+        row["outlier_handling"]    = plan.outlier_handling
+        row["imbalance_strategy"]  = plan.imbalance_strategy
+        row["composite_score"]     = round(res.score, 4)
+        row["cv_std"]              = round(res.cv_std, 4)
+        row["n_iterations"]        = _result.n_iterations
+        row["converged"]           = _result.converged
+        row["total_runtime_secs"]  = round(
+            sum(r2.runtime_secs for r2 in _result.history), 1
+        ) if _result.history else ""
+        # Individual metrics
+        for k in ["r2", "rmse", "mae", "median_ae", "f1_macro", "auc",
+                  "explained_variance", "mape"]:
+            v = res.metric_values.get(k, "")
+            try:
+                row[k] = round(float(v), 4) if v != "" else ""
+            except (TypeError, ValueError):
+                row[k] = ""
+        # LLM usage
+        row["n_llm_calls"]         = len(_result.llm_calls)
+        row["estimated_cost_usd"]  = round(
+            sum(r2.estimated_cost_usd for r2 in _result.llm_calls), 6
+        )
+    else:
+        for k in ["model", "imputation", "encoding", "scaling", "outlier_handling",
+                  "imbalance_strategy", "composite_score", "cv_std", "n_iterations",
+                  "converged", "total_runtime_secs", "r2", "rmse", "mae", "median_ae",
+                  "f1_macro", "auc", "explained_variance", "mape",
+                  "n_llm_calls", "estimated_cost_usd"]:
+            row[k] = ""
+
+    row["timestamp"]   = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
+    row["makes_sense"] = ""   # fill manually
+    row["notes"]       = ""   # fill manually
+
+    return pd.DataFrame([row])
+
+
+if st.session_state.result is not None:
+    _export_df = _build_export_row()
+
+    # Show preview so the user can verify before downloading
+    with st.expander("Preview export row", expanded=False):
+        st.dataframe(_export_df.T.rename(columns={0: "value"}), use_container_width=True)
+
+    _csv_bytes = _export_df.to_csv(index=False).encode("utf-8")
+    _fname = f"run_{st.session_state.get('dataset_name', 'unknown')}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv"
+
+    st.download_button(
+        label="Download run summary (CSV)",
+        data=_csv_bytes,
+        file_name=_fname,
+        mime="text/csv",
+        type="primary",
+        help="One-row CSV for your research results table. "
+             "Open in Excel/Sheets and fill in the 'makes_sense' and 'notes' columns.",
+    )
