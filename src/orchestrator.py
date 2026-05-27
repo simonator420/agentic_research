@@ -28,12 +28,14 @@ After the loop
 
 Public API
 ----------
-run_agentic_pipeline(df, target, ...) -> RunResult
+run_pipeline_from_goal(df, goal_text, ...)  -> RunResult | ExploratoryResult
+run_agentic_pipeline(df, target, ...)       -> RunResult
+run_exploratory_pipeline(df, ...)           -> ExploratoryResult
 """
 
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Union
 
 import pandas as pd
 
@@ -43,7 +45,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DB_PATH     = str(_PROJECT_ROOT / "storage" / "runs.db")
 _DEFAULT_CHROMA_DIR  = str(_PROJECT_ROOT / "storage" / "chroma_db")
 
-from src.agents.evaluator import build_user_report, evaluate_plans, generate_visualisations, select_best
+from src.agents.evaluator import (
+    build_exploratory_report,
+    build_user_report,
+    evaluate_plans,
+    generate_exploratory_visualisations,
+    generate_visualisations,
+    select_best,
+)
+from src.agents.data_preparer import DataPrepConfig, prepare_dataset
 from src.agents.executor import build_pipeline
 from src.agents.issue_detector import detect_issues, request_user_clarification
 from src.agents.planner import propose_action_plans
@@ -51,7 +61,247 @@ from src.agents.profiler import generate_profile
 from src.data.loader import dataset_fingerprint, split_data
 from src.memory.run_store import RunStore
 from src.memory.vector_store import VectorStore
-from src.models.schemas import AttemptRecord, ClarificationQuestion, RunResult
+from src.agents.goal_interpreter import build_task_specification
+from src.models.schemas import (
+    AttemptRecord,
+    ClarificationQuestion,
+    ExploratoryResult,
+    LLMCallRecord,
+    RunResult,
+    TaskSpecification,
+)
+
+
+def run_pipeline_from_goal(
+    df: pd.DataFrame,
+    goal_text: str,
+    target: Optional[str] = None,
+    run_id: Optional[str] = None,
+    max_rounds: int = 3,
+    n_plans_per_round: int = 3,
+    cv: int = 5,
+    score_threshold: float = 0.90,
+    min_improvement: float = 0.005,
+    db_path: str = _DEFAULT_DB_PATH,
+    chroma_dir: str = _DEFAULT_CHROMA_DIR,
+    claude_model: str = "claude-sonnet-4-6",
+    api_key: Optional[str] = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    verbose: bool = True,
+    use_memory: bool = True,
+    ask_clarifications: bool = True,
+    prefilled_questions: Optional[List[ClarificationQuestion]] = None,
+    figures_dir: str = "figures",
+    generate_report: bool = True,
+) -> Union[RunResult, ExploratoryResult]:
+    """
+    Main user-facing entry point: interprets a natural-language goal and routes
+    to the appropriate pipeline branch automatically.
+
+    Workflow
+    --------
+    goal_text → TaskSpecification (via Goal Interpreter)
+        ↓
+    if exploratory → run_exploratory_pipeline()
+    if predictive  → resolve/confirm target → run_agentic_pipeline()
+
+    Parameters
+    ----------
+    df          : raw input DataFrame.
+    goal_text   : natural-language description of what the user wants to achieve.
+    target      : optional explicit target column.  When provided, overrides the
+                  Goal Interpreter's suggestion (useful for programmatic calls
+                  or re-runs where the user has already confirmed the column).
+    All other parameters are forwarded to run_agentic_pipeline() or
+    run_exploratory_pipeline() as appropriate.
+
+    Returns
+    -------
+    RunResult for predictive goals, ExploratoryResult for exploratory goals.
+    Raises ValueError when a predictive goal cannot be resolved to a target column.
+    """
+    _log = print if verbose else (lambda *a, **k: None)
+
+    # Interpret goal → TaskSpecification
+    llm_calls: List[LLMCallRecord] = []
+    task_spec: TaskSpecification = build_task_specification(
+        goal_text, df, api_key=api_key, _call_log=llm_calls,
+    )
+    _log(f"Goal    : {goal_text}")
+    _log(f"Mode    : {task_spec.mode}  |  confidence={task_spec.confidence}")
+
+    if task_spec.mode == "exploratory":
+        _log("Routing to exploratory pipeline.")
+        return run_exploratory_pipeline(
+            df=df,
+            goal_text=goal_text,
+            run_id=run_id,
+            figures_dir=figures_dir,
+            verbose=verbose,
+            ask_clarifications=ask_clarifications,
+            prefilled_questions=prefilled_questions,
+        )
+
+    # Predictive path — resolve target column
+    resolved_target = target or task_spec.target_column
+    if resolved_target is None:
+        raise ValueError(
+            f"Goal '{goal_text}' was interpreted as predictive "
+            f"(confidence={task_spec.confidence}), but no target column could be "
+            f"identified.  Please pass target=<column_name> explicitly."
+        )
+    _log(f"Target  : {resolved_target}  (source: {'explicit' if target else 'goal interpreter'})")
+
+    return run_agentic_pipeline(
+        df=df,
+        target=resolved_target,
+        run_id=run_id,
+        max_rounds=max_rounds,
+        n_plans_per_round=n_plans_per_round,
+        cv=cv,
+        score_threshold=score_threshold,
+        min_improvement=min_improvement,
+        db_path=db_path,
+        chroma_dir=chroma_dir,
+        claude_model=claude_model,
+        api_key=api_key,
+        test_size=test_size,
+        random_state=random_state,
+        verbose=verbose,
+        use_memory=use_memory,
+        ask_clarifications=ask_clarifications,
+        prefilled_questions=prefilled_questions,
+        goal_text=goal_text,
+        figures_dir=figures_dir,
+        generate_report=generate_report,
+    )
+
+
+def run_exploratory_pipeline(
+    df: pd.DataFrame,
+    goal_text: Optional[str] = None,
+    run_id: Optional[str] = None,
+    figures_dir: str = "figures",
+    verbose: bool = True,
+    ask_clarifications: bool = False,
+    prefilled_questions: Optional[List[ClarificationQuestion]] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> ExploratoryResult:
+    """
+    Run an exploratory analysis — no target column, no ML training.
+
+    Profiles the full dataset (all columns treated as features), discovers natural
+    clusters, generates visualisations, and produces a plain-language report.
+    Suitable when the user's goal is to understand patterns or groupings rather
+    than to build a predictive model.
+
+    Parameters
+    ----------
+    df                 : raw input DataFrame (all columns are features).
+    goal_text          : user's natural-language goal — included in the report.
+    run_id             : optional identifier; auto-generated if None.
+    figures_dir        : directory where PNG visualisations are saved.
+    verbose            : print progress to stdout.
+    ask_clarifications : if True, interactively ask clarification questions via stdin.
+    prefilled_questions: pre-answered ClarificationQuestion list from a UI (skips stdin).
+
+    Returns
+    -------
+    ExploratoryResult with profile, issues, clusters, report, and visualisation paths.
+    """
+    import time
+    t_start = time.perf_counter()
+
+    run_id = run_id or str(uuid.uuid4())
+    _log = print if verbose else (lambda *a, **k: None)
+    _cb = progress_callback or (lambda p, m: None)
+
+    _log(f"Run ID : {run_id}  [EXPLORATORY MODE]")
+    if goal_text:
+        _log(f"Goal    : {goal_text}")
+    _log(f"Dataset : {len(df):,} rows × {len(df.columns)} cols")
+
+    # Profile all columns (no target → exploratory mode)
+    _cb(0.05, "Profiling dataset…")
+    profile = generate_profile(df, target=None, run_clustering=True)
+    _cb(0.40, "Detecting data quality issues…")
+    issues  = detect_issues(profile, df)
+    _cb(0.45, "Issues detected")
+
+    _log(f"Issues  : {len(issues)} detected "
+         f"({sum(i.severity.value == 'high' for i in issues)} HIGH, "
+         f"{sum(i.severity.value == 'medium' for i in issues)} MEDIUM)")
+    if profile.sports_context and profile.sports_context.is_sports:
+        sc = profile.sports_context
+        _log(f"Sports  : sports dataset detected (confidence={sc.confidence:.0%})  "
+             f"matched terms: {', '.join(sc.matched_terms[:6])}")
+    if profile.clusters:
+        _log(f"Clusters: {profile.clusters.n_clusters} natural groups found "
+             f"(silhouette={profile.clusters.silhouette_score:.3f})")
+
+    # Clarification questions
+    if prefilled_questions is not None:
+        clarification_questions = prefilled_questions
+    else:
+        clarification_questions = request_user_clarification(issues, profile)
+
+    if prefilled_questions is None and ask_clarifications and clarification_questions:
+        _log(f"\n{'─' * 50}")
+        _log(f"The system has {len(clarification_questions)} clarification question(s):")
+        for q in clarification_questions:
+            _log(f"\n  [{q.issue_type.upper()}] {q.question}")
+            try:
+                answer = input("  Your answer: ").strip()
+                q.answer = answer if answer else None
+            except (EOFError, OSError):
+                pass
+        _log(f"{'─' * 50}")
+
+    # Visualisations
+    _log("Generating visualisations...")
+    _cb(0.55, "Generating visualisations…")
+    vis_paths: list = []
+    try:
+        Path(figures_dir).mkdir(parents=True, exist_ok=True)
+        vis_paths = generate_exploratory_visualisations(
+            profile=profile,
+            X=df,
+            output_dir=figures_dir,
+        )
+        if vis_paths:
+            _log(f"Visualisations saved: {vis_paths}")
+    except Exception as exc:
+        _log(f"Visualisation generation skipped: {exc}")
+
+    # Plain-language report
+    _log("Building exploratory report...")
+    _cb(0.85, "Building report…")
+    user_report = ""
+    try:
+        user_report = build_exploratory_report(
+            profile=profile,
+            issues=issues,
+            goal_text=goal_text or "",
+            visualisation_paths=vis_paths,
+        )
+    except Exception as exc:
+        _log(f"Report generation skipped: {exc}")
+
+    _cb(1.0, "Done!")
+    runtime = time.perf_counter() - t_start
+    _log(f"\nDone. Exploratory analysis completed in {runtime:.1f}s.")
+
+    return ExploratoryResult(
+        run_id=run_id,
+        profile=profile,
+        issues=issues,
+        clarification_questions=clarification_questions,
+        user_report=user_report,
+        visualisation_paths=vis_paths,
+        llm_calls=[],
+        runtime_secs=runtime,
+    )
 
 
 def run_agentic_pipeline(
@@ -73,8 +323,10 @@ def run_agentic_pipeline(
     use_memory: bool = True,
     ask_clarifications: bool = True,
     prefilled_questions: Optional[List[ClarificationQuestion]] = None,
+    goal_text: Optional[str] = None,
     figures_dir: str = "figures",
     generate_report: bool = True,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> RunResult:
     """
     Run the full agentic pipeline optimisation loop on a tabular dataset.
@@ -105,6 +357,8 @@ def run_agentic_pipeline(
     prefilled_questions: pre-answered ClarificationQuestion list from an external UI (e.g.
                          Streamlit). When provided, internal question generation and the
                          input() loop are both skipped.
+    goal_text          : natural-language description of the user's analytical goal.
+                         Passed to the Planner so it can tailor plans and explanations.
     figures_dir        : directory where visualisation PNGs are saved.
     generate_report    : when True, builds a plain-language markdown report after the loop.
 
@@ -115,26 +369,50 @@ def run_agentic_pipeline(
     """
     run_id = run_id or str(uuid.uuid4())
     _log = print if verbose else (lambda *a, **k: None)
+    _cb = progress_callback or (lambda p, m: None)
 
     # ------------------------------------------------------------------
     # 1. Split — test set is held out entirely; all optimisation happens
     #    on X_train via cross-validation to prevent test set leakage.
     # ------------------------------------------------------------------
+    _cb(0.02, "Splitting dataset…")
     X_train, X_test, y_train, y_test = split_data(
         df, target, test_size=test_size, random_state=random_state
     )
     _log(f"Run ID : {run_id}")
+    if goal_text:
+        _log(f"Goal    : {goal_text}")
     _log(f"Dataset : {len(df):,} rows × {len(df.columns)} cols  |  target='{target}'")
     _log(f"Split   : {len(X_train):,} train / {len(X_test):,} test")
 
     # ------------------------------------------------------------------
-    # 2. Profile the training set (including exploratory clustering) and
+    # 2. Prepare the full dataset — drop structurally useless columns
+    #    (100%-missing, zero-variance) and duplicate rows BEFORE split.
+    #    This runs at the DataFrame level so the sklearn pipeline never
+    #    encounters all-NaN features, which avoids imputer warnings and
+    #    downstream linear-model NaN explosions.
+    #    The test set is re-derived after preparation so both splits share
+    #    the same column set.
+    # ------------------------------------------------------------------
+    _cb(0.05, "Preparing dataset…")
+    df_prepared, prep_report = prepare_dataset(df, target=target)
+    if prep_report.n_cols_dropped or prep_report.dropped_duplicate_rows:
+        _log(f"\nData prep: {prep_report.summary()}")
+    # Re-split on the cleaned DataFrame so train/test share identical columns
+    X_train, X_test, y_train, y_test = split_data(
+        df_prepared, target, test_size=test_size, random_state=random_state
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Profile the training set (including exploratory clustering) and
     #    detect data quality issues.  Profiling is done on train_df so
     #    that class distribution and target statistics reflect only
     #    training data; clustering runs on features only (target excluded).
     # ------------------------------------------------------------------
+    _cb(0.08, "Profiling training data…")
     train_df = pd.concat([X_train, y_train], axis=1)
     profile = generate_profile(train_df, target, run_clustering=True)
+    _cb(0.14, "Detecting data quality issues…")
     issues = detect_issues(profile, train_df)
 
     _log(f"\nTask    : {profile.target_type.value}")
@@ -194,6 +472,7 @@ def run_agentic_pipeline(
     fp = dataset_fingerprint(profile)
     profile.fingerprint = fp
 
+    _cb(0.18, "Querying memory for similar past runs…")
     if use_memory:
         vstore = VectorStore(chroma_dir)
         memory = vstore.retrieve_similar(fp, top_k=3)
@@ -207,17 +486,26 @@ def run_agentic_pipeline(
     # 4. Agentic optimisation loop
     # ------------------------------------------------------------------
     history = []
+    llm_calls: List[LLMCallRecord] = []
     overall_best_result = None
     overall_best_plan = None
     no_improvement_count = 0
     converged = False
     round_num = 0
 
+    # Progress budget: 20% setup → 80% loop → 20% finalise
+    _LOOP_START = 0.20
+    _LOOP_END   = 0.80
+
     with RunStore(db_path) as run_store:
         for round_num in range(1, max_rounds + 1):
             _log(f"\n{'─' * 50}")
             _log(f"Round {round_num}/{max_rounds}")
             _log(f"{'─' * 50}")
+
+            _round_base = _LOOP_START + (round_num - 1) / max_rounds * (_LOOP_END - _LOOP_START)
+            _round_size = (_LOOP_END - _LOOP_START) / max_rounds
+            _cb(_round_base, f"Round {round_num}/{max_rounds} — asking AI planner…")
 
             # --- Planner: propose candidate configurations ---
             plans, reasoning = propose_action_plans(
@@ -226,12 +514,16 @@ def run_agentic_pipeline(
                 history=history,
                 memory=memory,
                 clarification_questions=clarification_questions,
+                goal_text=goal_text,
                 n_plans=n_plans_per_round,
                 model=claude_model,
                 api_key=api_key,
+                _call_log=llm_calls,
             )
             _log(f"Planner : {len(plans)} plans proposed")
             _log(f"Reasoning: {reasoning}")
+            _cb(_round_base + _round_size * 0.35,
+                f"Round {round_num}/{max_rounds} — evaluating {len(plans)} pipeline(s) with {cv}-fold CV…")
 
             # --- Evaluator: cross-validate every candidate ---
             results = evaluate_plans(plans, profile, X_train, y_train, cv=cv)
@@ -260,6 +552,9 @@ def run_agentic_pipeline(
                 _log(f"No significant improvement "
                      f"(plateau counter: {no_improvement_count}/2)")
 
+            _cb(_round_base + _round_size * 0.95,
+                f"Round {round_num}/{max_rounds} — best score so far: {overall_best_result.score:.4f}")
+
             # --- Convergence checks ---
             if overall_best_result.score >= score_threshold:
                 _log(f"\nScore threshold {score_threshold} reached — converged.")
@@ -277,6 +572,7 @@ def run_agentic_pipeline(
     # ------------------------------------------------------------------
     _log(f"\n{'─' * 50}")
     _log("Fitting best pipeline on full training set...")
+    _cb(0.82, "Fitting best pipeline on full training set…")
     best_pipeline = build_pipeline(overall_best_plan, profile, X_train)
     best_pipeline.fit(X_train, y_train)
 
@@ -299,6 +595,7 @@ def run_agentic_pipeline(
 
     if generate_report:
         _log("Generating visualisations and user report...")
+        _cb(0.87, "Generating visualisations…")
         try:
             vis_paths = generate_visualisations(
                 profile=profile,
@@ -313,6 +610,7 @@ def run_agentic_pipeline(
         except Exception as exc:
             _log(f"Visualisation generation skipped: {exc}")
 
+        _cb(0.93, "Building report…")
         try:
             user_report = build_user_report(
                 profile=profile,
@@ -324,8 +622,13 @@ def run_agentic_pipeline(
         except Exception as exc:
             _log(f"User report generation skipped: {exc}")
 
+    _cb(1.0, "Done!")
+    total_cost = sum(r.estimated_cost_usd for r in llm_calls)
     _log(f"\nDone. Best score: {overall_best_result.score:.4f} "
          f"in {round_num} round(s). Converged: {converged}")
+    _log(f"LLM calls: {len(llm_calls)}  |  "
+         f"total tokens: {sum(r.input_tokens + r.output_tokens for r in llm_calls):,}  |  "
+         f"estimated cost: ${total_cost:.4f}")
 
     return RunResult(
         best_pipeline=best_pipeline,
@@ -337,4 +640,5 @@ def run_agentic_pipeline(
         run_id=run_id,
         clarification_questions=clarification_questions,
         user_report=user_report,
+        llm_calls=llm_calls,
     )

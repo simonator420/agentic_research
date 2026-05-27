@@ -55,8 +55,8 @@ def _mock_planner(plans_per_call):
     call_count = {"n": 0}
 
     def _mock(profile, issues, history, memory=None,
-               clarification_questions=None,
-               n_plans=3, model=None, api_key=None, max_retries=2):
+               clarification_questions=None, goal_text=None,
+               n_plans=3, model=None, api_key=None, max_retries=2, _call_log=None):
         idx = call_count["n"]
         call_count["n"] += 1
         batch = plans_per_call[idx % len(plans_per_call)]
@@ -324,8 +324,8 @@ def test_use_memory_false_passes_empty_memory_to_planner(tmp_path, binary_df):
     received_memory = []
 
     def _capturing_mock(profile, issues, history, memory=None,
-                        clarification_questions=None,
-                        n_plans=3, model=None, api_key=None, max_retries=2):
+                        clarification_questions=None, goal_text=None,
+                        n_plans=3, model=None, api_key=None, max_retries=2, _call_log=None):
         received_memory.append(memory)
         return _make_plans(), "mock reasoning"
 

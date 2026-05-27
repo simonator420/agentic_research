@@ -36,8 +36,35 @@ from src.models.schemas import (
     ClusterResult,
     DataProfile,
     Issue,
+    LLMCallRecord,
     TargetType,
 )
+
+# ---------------------------------------------------------------------------
+# LLM pricing (USD per 1 M tokens) — for cost tracking across runs
+# ---------------------------------------------------------------------------
+_PRICING: dict = {
+    "claude-sonnet-4-6":  {"input": 3.00, "output": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-opus-4-7":    {"input": 15.00, "output": 75.00, "cache_write": 18.75, "cache_read": 1.50},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00, "cache_write": 1.00, "cache_read": 0.08},
+}
+_DEFAULT_PRICING = _PRICING["claude-sonnet-4-6"]
+
+
+def _estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write: int,
+    cache_read: int,
+) -> float:
+    p = _PRICING.get(model, _DEFAULT_PRICING)
+    return (
+        input_tokens  * p["input"]       / 1_000_000
+        + output_tokens * p["output"]      / 1_000_000
+        + cache_write   * p["cache_write"] / 1_000_000
+        + cache_read    * p["cache_read"]  / 1_000_000
+    )
 
 # ---------------------------------------------------------------------------
 # System prompt — cached; describes role, constraints, and JSON schema
@@ -194,13 +221,17 @@ def _format_profile(profile: DataProfile) -> str:
     lines.append("COLUMNS")
     lines.append("-------")
 
+    def _fmt(v) -> str:
+        """Format a numeric stat that may be None (all-NaN column)."""
+        return f"{v:.2g}" if v is not None else "N/A"
+
     for col_name, col in profile.columns.items():
         if col.dtype == "numeric":
             lines.append(
                 f"  {col_name:<20} [numeric]    missing={col.missing_rate:.1%}"
-                f"  mean={col.mean:.2g}  std={col.std:.2g}"
-                f"  range=[{col.min:.2g}, {col.max:.2g}]"
-                f"  q1={col.q1:.2g}  q3={col.q3:.2g}"
+                f"  mean={_fmt(col.mean)}  std={_fmt(col.std)}"
+                f"  range=[{_fmt(col.min)}, {_fmt(col.max)}]"
+                f"  q1={_fmt(col.q1)}  q3={_fmt(col.q3)}"
             )
         elif col.dtype == "categorical":
             top = ", ".join(f"{k}={v}" for k, v in list((col.top_categories or {}).items())[:5])
@@ -245,7 +276,15 @@ def _format_history(history: List[AttemptRecord]) -> str:
     for rec in history:
         p = rec.plan
         r = rec.result
-        metrics_str = "  ".join(f"{k}={v:.3f}" for k, v in r.metric_values.items())
+        def _fmt_v(v) -> str:
+            """Format a metric value that may be float, NaN, or a string error message."""
+            try:
+                return f"{float(v):.3f}"
+            except (TypeError, ValueError):
+                # Preserve short error strings (e.g. "error") so the Planner can
+                # see that this pipeline failed and avoid repeating the same config.
+                return str(v)[:40] if isinstance(v, str) else "N/A"
+        metrics_str = "  ".join(f"{k}={_fmt_v(v)}" for k, v in r.metric_values.items())
         config = f"{p.imputation}/{p.outlier_handling}/{p.encoding}/{p.scaling}/{p.model}/{p.imbalance_strategy}"
         lines.append(
             f"  {rec.iteration:<5} {r.score:<7.4f} {r.cv_std:<8.4f} {metrics_str:<30} {config}"
@@ -298,6 +337,22 @@ def _format_clusters(clusters: Optional[ClusterResult]) -> str:
         "non-linear interactions well (gradient_boosting, xgboost, lightgbm)."
     )
     return "\n".join(lines)
+
+
+def _format_goal(goal_text: Optional[str]) -> str:
+    """
+    Render the user's natural-language goal for the LLM prompt.
+    Placed at the top of the profile block so the Planner always has the
+    user's intent in context when proposing pipeline configurations.
+    """
+    if not goal_text or not goal_text.strip():
+        return ""
+    return (
+        "═══ USER GOAL ══════════════════════════════════════════════════════\n"
+        f"  \"{goal_text.strip()}\"\n"
+        "  Use this goal when deciding which metric to prioritise, which model\n"
+        "  family fits the task best, and how to phrase plain-language explanations."
+    )
 
 
 def _format_sports_context(profile: DataProfile) -> str:
@@ -433,10 +488,12 @@ def propose_action_plans(
     history: List[AttemptRecord],
     memory: Optional[List[ActionPlan]] = None,
     clarification_questions: Optional[List[ClarificationQuestion]] = None,
+    goal_text: Optional[str] = None,
     n_plans: int = 3,
     model: str = "claude-sonnet-4-6",
     api_key: Optional[str] = None,
     max_retries: int = 2,
+    _call_log: Optional[List] = None,
 ) -> Tuple[List[ActionPlan], str]:
     """
     Call the Claude API and return a list of candidate ActionPlans.
@@ -455,6 +512,9 @@ def propose_action_plans(
     history                 : All AttemptRecords from previous iterations of the current run.
     memory                  : ActionPlans retrieved from ChromaDB for similar past datasets.
     clarification_questions : Questions whose answers should be passed to the Planner.
+    goal_text               : User's natural-language goal (e.g. "predict player injury risk").
+                              Included in the cached profile block so the Planner can tailor
+                              metric priorities and plain-language explanations to the goal.
     n_plans                 : Number of candidate plans to request (default 3).
     model                   : Claude model ID to use.
     api_key                 : Anthropic API key; falls back to ANTHROPIC_API_KEY env var.
@@ -464,13 +524,25 @@ def propose_action_plans(
     -------
     (plans, reasoning) — list of ActionPlans and Claude's explanation string.
     """
-    client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    # Sanitise key — HTTP headers must be ASCII-only; a leading emoji (e.g. from
+    # an accidental copy-paste) would cause httpx to raise UnicodeEncodeError.
+    _key = (api_key or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if _key and not _key.isascii():
+        raise ValueError(
+            "Anthropic API key contains non-ASCII characters. "
+            "Please check the key — it should start with 'sk-ant-'."
+        )
+    client = anthropic.Anthropic(api_key=_key or None)
 
     # Fill the n_plans placeholder in the system prompt
     system_prompt = _SYSTEM_PROMPT.format(n_plans=n_plans)
 
     # Build the static-within-run profile+issues+clusters+sports block (cacheable)
-    profile_parts = [_format_profile(profile), _format_issues(issues)]
+    profile_parts = []
+    goal_text_block = _format_goal(goal_text)
+    if goal_text_block:
+        profile_parts.append(goal_text_block)
+    profile_parts += [_format_profile(profile), _format_issues(issues)]
     sports_text = _format_sports_context(profile)
     if sports_text:
         profile_parts.append(sports_text)
@@ -496,10 +568,15 @@ def propose_action_plans(
 
     last_error: Optional[Exception] = None
 
+    # Each plan needs ~600 tokens (JSON fields + plain_language_explanation).
+    # Add 800 tokens for the shared reasoning block.
+    # Minimum 2048 so simple single-plan calls always have headroom.
+    _max_tokens = max(2048, n_plans * 600 + 800)
+
     for attempt in range(max_retries + 1):
         response = client.messages.create(
             model=model,
-            max_tokens=1024,
+            max_tokens=_max_tokens,
             system=[
                 {
                     "type": "text",
@@ -529,6 +606,33 @@ def propose_action_plans(
         )
 
         raw = response.content[0].text.strip()
+
+        # Detect output truncation early — retrying with the same budget won't help.
+        # Raise immediately with a clear message so the error surfaces to the user.
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise RuntimeError(
+                f"Planner response was truncated (hit {_max_tokens}-token output limit). "
+                f"This can happen with very wide datasets (many columns) or long explanations. "
+                f"Try reducing 'Plans per round' in Settings, or contact the developer."
+            )
+
+        # Track LLM token usage and cost
+        usage = response.usage
+        input_tok  = getattr(usage, "input_tokens", 0)
+        output_tok = getattr(usage, "output_tokens", 0)
+        cache_r    = getattr(usage, "cache_read_input_tokens", 0)
+        cache_w    = getattr(usage, "cache_creation_input_tokens", 0)
+        cost = _estimate_cost(model, input_tok, output_tok, cache_w, cache_r)
+        if _call_log is not None:
+            _call_log.append(LLMCallRecord(
+                purpose="plan_proposal",
+                model=model,
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                cache_read_tokens=cache_r,
+                cache_write_tokens=cache_w,
+                estimated_cost_usd=cost,
+            ))
 
         # Strip markdown code fences if Claude wraps the JSON (defensive)
         if raw.startswith("```"):

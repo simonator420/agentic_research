@@ -26,8 +26,9 @@ discover_clusters(df, method="auto", max_k=8, random_state=42)  -> Optional[Clus
 summarize_patterns(df, clusters)                                  -> ClusterResult
 """
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from src.agents.sports_vocabulary import detect_sports_context
@@ -114,6 +115,81 @@ def _infer_target_type(series: pd.Series) -> TargetType:
     return TargetType.MULTICLASS
 
 
+def _kmeans_sweep(X_scaled, max_k: int, random_state: int) -> Optional[tuple]:
+    """Return (best_k, best_sil, best_labels) from k-means sweep, or None."""
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    upper_k = min(max_k + 1, X_scaled.shape[0] // 5 + 1)
+    if upper_k <= 2:
+        return None
+    best_k, best_sil, best_labels = 2, -1.0, None
+    for k in range(2, upper_k):
+        km = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
+        labels = km.fit_predict(X_scaled)
+        # np.errstate suppresses known sklearn/numpy numerical warnings that arise
+        # from the algebraic euclidean-distance shortcut (-2·XᵀY) used internally
+        # by silhouette_score.  The final score is still correct — sklearn handles
+        # any resulting NaN values — but the warnings clutter the console output.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            sil = float(silhouette_score(X_scaled, labels))
+        if sil > best_sil:
+            best_sil, best_k, best_labels = sil, k, labels
+    return (best_k, best_sil, best_labels) if best_labels is not None else None
+
+
+def _hierarchical_sweep(X_scaled, max_k: int) -> Optional[tuple]:
+    """Return (best_k, best_sil, best_labels) from agglomerative sweep, or None."""
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.metrics import silhouette_score
+
+    upper_k = min(max_k + 1, X_scaled.shape[0] // 5 + 1)
+    if upper_k <= 2:
+        return None
+    best_k, best_sil, best_labels = 2, -1.0, None
+    for k in range(2, upper_k):
+        hc = AgglomerativeClustering(n_clusters=k, linkage="ward")
+        labels = hc.fit_predict(X_scaled)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            sil = float(silhouette_score(X_scaled, labels))
+        if sil > best_sil:
+            best_sil, best_k, best_labels = sil, k, labels
+    return (best_k, best_sil, best_labels) if best_labels is not None else None
+
+
+def _dbscan_sweep(X_scaled) -> Optional[tuple]:
+    """
+    Return (n_clusters, best_sil, best_labels) from DBSCAN eps sweep, or None.
+    Tries a range of eps values and picks the one with the highest silhouette.
+    Noise points (label == -1) are excluded from the silhouette calculation.
+    """
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+    from sklearn.metrics import silhouette_score
+
+    eps_candidates = [0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
+    best_sil, best_labels, best_n = -1.0, None, 0
+
+    for eps in eps_candidates:
+        db = DBSCAN(eps=eps, min_samples=5)
+        labels = db.fit_predict(X_scaled)
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        if n_clusters < 2:
+            continue
+        # Only score non-noise points
+        mask = labels != -1
+        if mask.sum() < 10:
+            continue
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            sil = float(silhouette_score(X_scaled[mask], labels[mask]))
+        if sil > best_sil:
+            best_sil = sil
+            best_labels = labels
+            best_n = n_clusters
+
+    return (best_n, best_sil, best_labels) if best_labels is not None else None
+
+
 def discover_clusters(
     df: pd.DataFrame,
     method: str = "auto",
@@ -123,17 +199,22 @@ def discover_clusters(
     """
     Run unsupervised clustering on the numeric features of a DataFrame.
 
-    Uses k-means with the number of clusters chosen by the highest silhouette score
-    across k ∈ [2, min(max_k, n_rows//5)].  Returns None when the DataFrame has
-    fewer than 20 complete numeric rows or fewer than 2 numeric columns — these
-    constraints prevent meaningless clustering on degenerate inputs.
+    Three algorithms are supported:
+      "kmeans"      — k-means with k selected by highest silhouette score across
+                      k ∈ [2, min(max_k, n_rows//5)].
+      "hierarchical"— Ward-linkage agglomerative clustering; same k sweep.
+      "dbscan"      — DBSCAN with eps sweep; number of clusters determined by the
+                      data rather than pre-specified.
+      "auto"        — runs all three, returns the result with the highest silhouette.
+
+    Returns None when the DataFrame has fewer than 20 complete numeric rows or
+    fewer than 2 numeric columns.
 
     Parameters
     ----------
     df           : DataFrame to cluster (target column should already be excluded).
-    method       : "auto" selects k-means; reserved for future extension to
-                   "hierarchical" or "dbscan".
-    max_k        : maximum number of clusters to consider.
+    method       : "auto" | "kmeans" | "hierarchical" | "dbscan"
+    max_k        : maximum number of clusters to consider (k-means / hierarchical).
     random_state : random seed for reproducibility.
 
     Returns
@@ -142,13 +223,20 @@ def discover_clusters(
     or None if clustering is not feasible on this data.
     """
     try:
-        from sklearn.cluster import KMeans
         from sklearn.metrics import davies_bouldin_score, silhouette_score
         from sklearn.preprocessing import StandardScaler
     except ImportError:
         return None
 
-    numeric_df = df.select_dtypes(include="number").dropna()
+    numeric_df = (
+        df.select_dtypes(include="number")
+        .replace([np.inf, -np.inf], np.nan)  # ±inf → NaN so dropna catches them
+        .dropna()
+    )
+
+    # Drop zero-variance columns (e.g. season=2024 for every row in NBA data).
+    # StandardScaler divides by std; std=0 produces NaN/inf in the scaled matrix.
+    numeric_df = numeric_df.loc[:, numeric_df.std() > 0]
 
     if len(numeric_df) < 20 or len(numeric_df.columns) < 2:
         return None
@@ -156,22 +244,40 @@ def discover_clusters(
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(numeric_df)
 
-    upper_k = min(max_k + 1, len(numeric_df) // 5 + 1)
-    if upper_k <= 2:
+    # Run the requested method(s) and pick the best result by silhouette
+    candidates = []
+
+    if method in ("kmeans", "auto"):
+        r = _kmeans_sweep(X_scaled, max_k, random_state)
+        if r:
+            candidates.append((*r, "kmeans"))
+
+    if method in ("hierarchical", "auto"):
+        try:
+            r = _hierarchical_sweep(X_scaled, max_k)
+            if r:
+                candidates.append((*r, "hierarchical"))
+        except Exception:
+            pass
+
+    if method in ("dbscan", "auto"):
+        try:
+            r = _dbscan_sweep(X_scaled)
+            if r:
+                candidates.append((*r, "dbscan"))
+        except Exception:
+            pass
+
+    if not candidates:
         return None
 
-    best_k, best_sil, best_labels = 2, -1.0, None
-    for k in range(2, upper_k):
-        km = KMeans(n_clusters=k, random_state=random_state, n_init="auto")
-        labels = km.fit_predict(X_scaled)
-        sil = float(silhouette_score(X_scaled, labels))
-        if sil > best_sil:
-            best_sil, best_k, best_labels = sil, k, labels
+    # Pick the winner — highest silhouette score
+    best_k, best_sil, best_labels, best_method = max(candidates, key=lambda c: c[1])
 
-    if best_labels is None:
-        return None
-
-    db = float(davies_bouldin_score(X_scaled, best_labels))
+    # For DBSCAN, map noise points (-1) to their own cluster or nearest cluster?
+    # Simple approach: keep -1 as is — summarize_patterns will handle it
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        db_score = float(davies_bouldin_score(X_scaled, best_labels))
 
     return ClusterResult(
         n_clusters=best_k,
@@ -179,9 +285,9 @@ def discover_clusters(
         valid_indices=numeric_df.index.tolist(),
         numeric_columns=list(numeric_df.columns),
         silhouette_score=best_sil,
-        davies_bouldin_index=db,
+        davies_bouldin_index=db_score,
         cluster_summaries={},
-        method="kmeans",
+        method=best_method,
     )
 
 
@@ -209,8 +315,11 @@ def summarize_patterns(df: pd.DataFrame, clusters: ClusterResult) -> ClusterResu
     overall_mean = valid_df.mean()
     labels_series = pd.Series(clusters.labels, index=clusters.valid_indices)
 
+    # Unique non-noise cluster IDs (DBSCAN uses -1 for noise; skip those)
+    cluster_ids = sorted(cid for cid in labels_series.unique() if cid >= 0)
+
     summaries: Dict[int, str] = {}
-    for cid in range(clusters.n_clusters):
+    for cid in cluster_ids:
         mask = labels_series == cid
         cluster_mean = valid_df.loc[mask].mean()
         diff = (cluster_mean - overall_mean).abs()
@@ -238,7 +347,7 @@ def summarize_patterns(df: pd.DataFrame, clusters: ClusterResult) -> ClusterResu
 
 def generate_profile(
     df: pd.DataFrame,
-    target: str,
+    target: Optional[str] = None,
     run_clustering: bool = True,
 ) -> DataProfile:
     """
@@ -251,7 +360,9 @@ def generate_profile(
     Parameters
     ----------
     df             : raw input DataFrame (train + test combined, before any split).
-    target         : name of the column to predict.
+    target         : name of the column to predict.  When None the pipeline runs in
+                     exploratory mode — all columns are treated as features and no
+                     task-type inference or class distribution is computed.
     run_clustering : when True, calls discover_clusters() and summarize_patterns()
                      and attaches the result to DataProfile.clusters.  Set to False
                      for speed in unit tests or ablation runs where exploratory output
@@ -261,21 +372,24 @@ def generate_profile(
     -------
     DataProfile — used by all downstream agents and stored in memory.
     """
-    if target not in df.columns:
+    if target is not None and target not in df.columns:
         raise ValueError(f"Target column '{target}' not found in DataFrame")
 
     columns: Dict[str, ColumnProfile] = {col: _profile_column(df[col]) for col in df.columns}
 
-    target_type = _infer_target_type(df[target])
-
-    # Class distribution is only meaningful for classification tasks.
-    if target_type == TargetType.REGRESSION:
-        class_dist = None
+    if target is not None:
+        target_type = _infer_target_type(df[target])
+        if target_type == TargetType.REGRESSION:
+            class_dist = None
+        else:
+            counts = df[target].value_counts(normalize=True)
+            class_dist = {str(k): float(v) for k, v in counts.items()}
+        feature_df = df.drop(columns=[target])
     else:
-        counts = df[target].value_counts(normalize=True)
-        class_dist = {str(k): float(v) for k, v in counts.items()}
-
-    feature_df = df.drop(columns=[target])
+        # Exploratory mode: no prediction target
+        target_type = TargetType.REGRESSION   # dummy — not used for modelling
+        class_dist = None
+        feature_df = df.copy()
 
     # Sports domain vocabulary detection — scans column names only, no data access.
     sports_ctx = detect_sports_context(feature_df)

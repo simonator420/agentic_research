@@ -211,7 +211,7 @@ def _leakage_issues(profile: DataProfile, df: pd.DataFrame) -> List[Issue]:
     issues = []
     target = profile.target_column
 
-    if profile.target_type != TargetType.REGRESSION:
+    if target is None or profile.target_type != TargetType.REGRESSION:
         return issues
 
     target_series = df[target]

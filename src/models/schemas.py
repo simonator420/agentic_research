@@ -15,6 +15,9 @@ RunResult            : final output of the Orchestrator — best pipeline, plan,
                        clarification questions asked, and the plain-language user report.
 BaselineResult       : output of a baseline method (rule-based or search-based), in the same
                        format as RunResult so results can be compared directly.
+LLMCallRecord        : token usage and cost for a single LLM API call.
+TaskSpecification    : structured output of the Goal Interpreter — mode, task type, target column.
+ExploratoryResult    : output of the exploratory pipeline (no ML training).
 TargetType           : inferred task type (binary classification / multiclass / regression).
 IssueSeverity        : HIGH / MEDIUM / LOW, used by the Planner to prioritise fixes.
 IssueType            : category of a detected problem.
@@ -47,6 +50,63 @@ class IssueType(str, Enum):
     NOISY_CATEGORIES = "noisy_categories"   # very high cardinality — likely ID or free-text
     LEAKAGE_CANDIDATE = "leakage_candidate" # feature correlates suspiciously well with target
     CLASS_IMBALANCE = "class_imbalance"
+
+
+@dataclass
+class LLMCallRecord:
+    """
+    Records a single LLM API call — for token usage and cost tracking.
+
+    Used to quantify the LLM overhead of the agentic system relative to baselines
+    and to report research metrics (n_llm_calls, input_tokens, estimated_cost).
+
+    Attributes
+    ----------
+    purpose              : human-readable label, e.g. "plan_proposal" | "goal_interpretation".
+    model                : Claude model ID used for the call.
+    input_tokens         : non-cached input tokens billed at standard input rate.
+    output_tokens        : output tokens.
+    cache_read_tokens    : tokens served from prompt cache (billed at cache read rate).
+    cache_write_tokens   : tokens written to prompt cache (billed at cache write rate).
+    estimated_cost_usd   : total estimated cost at standard Anthropic list pricing.
+    """
+    purpose: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    estimated_cost_usd: float
+
+
+@dataclass
+class TaskSpecification:
+    """
+    Structured interpretation of a user's natural-language goal.
+
+    Output of the Goal Interpreter Agent.  Determines whether the user wants a
+    predictive model (requires a target column) or an exploratory analysis (no
+    target column — profiling, clustering, and pattern discovery only).
+
+    Attributes
+    ----------
+    mode             : "predictive" | "exploratory"
+    task_type        : "classification" | "regression" | "exploratory"
+    goal             : the original goal_text string.
+    target_column    : best-matching column to predict; None when mode=="exploratory".
+    requested_outputs: list drawn from ["model", "report", "visualisations", "clusters"].
+    confidence       : "high" | "medium" | "low" — how clearly the goal maps to a column.
+    explanation      : one plain-language sentence for a non-technical user.
+    alternatives     : other plausible target columns the user might prefer.
+    """
+    mode: str
+    task_type: str
+    goal: str
+    target_column: Optional[str]
+    requested_outputs: List[str]
+    confidence: str
+    explanation: str
+    alternatives: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -136,7 +196,7 @@ class DataProfile:
     """
     n_rows: int
     n_cols: int
-    target_column: str
+    target_column: Optional[str]                    # None in exploratory mode (no prediction target)
     target_type: TargetType
     class_distribution: Optional[Dict[str, float]]  # {class_label: frequency}; None for regression
     columns: Dict[str, ColumnProfile]               # keyed by column name
@@ -159,6 +219,35 @@ class Issue:
     affected_column: Optional[str]  # None for dataset-level issues (e.g. duplicates)
     description: str                # human-readable summary for the LLM prompt
     evidence: Dict[str, Any]        # raw numbers supporting the finding
+
+
+@dataclass
+class ExploratoryResult:
+    """
+    Output of run_exploratory_pipeline() — exploratory analysis without ML training.
+
+    Contains profiling results, cluster patterns, data quality issues, and a plain-language
+    report.  There is no trained pipeline — the user asked for exploration, not prediction.
+
+    Attributes
+    ----------
+    run_id                  : unique identifier for this run.
+    profile                 : full DataProfile (all columns, target_column=None).
+    issues                  : data quality issues detected by the Issue Detector.
+    clarification_questions : questions surfaced during analysis (with any user answers).
+    user_report             : plain-language markdown report for non-technical users.
+    visualisation_paths     : paths to generated PNG files.
+    llm_calls               : token usage for any LLM calls made during the run.
+    runtime_secs            : total wall-clock time.
+    """
+    run_id: str
+    profile: DataProfile
+    issues: List["Issue"]
+    clarification_questions: List[ClarificationQuestion]
+    user_report: str
+    visualisation_paths: List[str] = field(default_factory=list)
+    llm_calls: List[LLMCallRecord] = field(default_factory=list)
+    runtime_secs: float = 0.0
 
 
 @dataclass
@@ -251,6 +340,7 @@ class RunResult:
     run_id: str
     clarification_questions: List[ClarificationQuestion] = field(default_factory=list)
     user_report: str = ""       # plain-language markdown report for non-technical sports users
+    llm_calls: List[LLMCallRecord] = field(default_factory=list)  # token usage across all LLM calls
 
 
 @dataclass

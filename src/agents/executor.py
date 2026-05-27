@@ -33,6 +33,7 @@ from sklearn.ensemble import (
     RandomForestRegressor,
 )
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401 — must import before IterativeImputer
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import IterativeImputer, KNNImputer, SimpleImputer
 from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
@@ -80,6 +81,49 @@ class Winsorizer(BaseEstimator, TransformerMixin):
     def transform(self, X):
         X = np.asarray(X, dtype=float).copy()
         return np.clip(X, self.lower_, self.upper_)
+
+
+class InfToNaN(BaseEstimator, TransformerMixin):
+    """
+    Replace ±inf with NaN before imputation.
+
+    NBA shot logs (and many sports datasets) can contain Inf values from
+    derived stats — e.g. shot_distance / 0, fg_pct with 0 attempts, etc.
+    sklearn imputers handle NaN natively but silently propagate Inf, which
+    then causes divide-by-zero and overflow warnings in downstream scalers
+    and matrix operations.  Placing this step first in the numeric pipeline
+    ensures all subsequent steps see only finite values or NaN.
+    """
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float).copy()
+        X[~np.isfinite(X)] = np.nan
+        return X
+
+
+class AllNaNDropper(BaseEstimator, TransformerMixin):
+    """
+    Drop columns that are 100 % NaN in the training fold before imputation.
+
+    SimpleImputer emits a UserWarning and leaves all-NaN columns untouched
+    (still NaN), which then causes matmul overflow in linear models downstream.
+    Dropping them here prevents that warning and avoids the downstream
+    numerical instability entirely.  VarianceThreshold later catches any
+    near-zero-variance columns that survive imputation.
+    """
+
+    def fit(self, X, y=None):
+        X = np.asarray(X, dtype=float)
+        # Keep columns that have at least one non-NaN value in the training fold
+        self.valid_cols_ = ~np.all(np.isnan(X), axis=0)
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        return X[:, self.valid_cols_]
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +278,19 @@ def build_pipeline(plan: ActionPlan, profile: DataProfile, X: pd.DataFrame) -> P
     ]
 
     # --- Numeric sub-pipeline ---
-    numeric_steps = [("imputer", _get_imputer(plan.imputation))]
+    # InfToNaN must be first: sports datasets often have ±inf from derived stats
+    # (e.g. fg_pct with 0 attempts).  Imputers handle NaN but propagate Inf.
+    numeric_steps = [
+        ("inf_to_nan", InfToNaN()),
+        ("drop_all_nan", AllNaNDropper()),   # removes 100%-missing cols before imputer
+        ("imputer", _get_imputer(plan.imputation)),
+    ]
     if plan.outlier_handling == "winsorize":
         # Winsorizer is inserted after imputation so it never sees NaN values
         numeric_steps.append(("outlier", Winsorizer()))
+    # Drop zero-variance columns before scaling to prevent StandardScaler from
+    # dividing by std=0, which produces NaN/inf and RuntimeWarning matmul errors.
+    numeric_steps.append(("var_thresh", VarianceThreshold(threshold=0.0)))
     if plan.scaling != "none":
         numeric_steps.append(("scaler", _get_scaler(plan.scaling)))
 

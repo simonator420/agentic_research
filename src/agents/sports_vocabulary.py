@@ -35,6 +35,7 @@ get_missingness_question(col_name) -> Optional[str]
 get_cardinality_question(col_name) -> Optional[str]
 """
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -234,6 +235,58 @@ _CATEGORY_TO_BUCKET: Dict[str, str] = {
 _SPORTS_THRESHOLD    = 0.05   # ≥5% columns matched → call it sports
 _AMBIGUOUS_THRESHOLD = 0.02   # 2–5% matched → ask the user to confirm
 
+# Fuzzy matching: similarity ratio threshold (difflib SequenceMatcher).
+# 0.75 catches common misspellings and abbreviation variants.
+_FUZZY_THRESHOLD = 0.75
+
+# Weight of fuzzy and value-based matches in the confidence calculation
+# (full-weight exact matches = 1.0, partial-weight soft signals = 0.5).
+_FUZZY_WEIGHT = 0.5
+
+# Sports-related categorical values — scan top sample values of string columns.
+_SPORTS_VALUE_TERMS: Dict[str, str] = {
+    # Playing positions — football/soccer
+    "goalkeeper": "entity", "defender": "entity", "midfielder": "entity",
+    "forward": "entity", "striker": "entity", "winger": "entity",
+    "fullback": "entity", "center back": "entity", "centre back": "entity",
+    # Playing positions — basketball
+    "point guard": "entity", "shooting guard": "entity",
+    "power forward": "entity", "small forward": "entity",
+    # Match outcomes
+    "home win": "performance", "away win": "performance",
+    "clean sheet": "performance",
+    # Injury types
+    "hamstring": "injury", "anterior cruciate": "injury",
+    "groin strain": "injury", "ankle sprain": "injury",
+    "muscle tear": "injury", "concussion": "injury",
+    # Event types (Opta / StatsBomb)
+    "shot on target": "performance", "key pass": "performance",
+    "successful dribble": "performance", "tackle won": "performance",
+    "aerial duel": "performance",
+    # Venues
+    "home": "spatial", "away": "spatial",
+}
+
+def _build_alias_list() -> List[Tuple[str, str, str]]:
+    """Lazily build the flat (alias, category, canonical) list for fuzzy matching."""
+    result = []
+    for cat, synonyms in _CATEGORIES.items():
+        for canonical, aliases in synonyms.items():
+            for alias in aliases:
+                if len(alias) >= 4:
+                    result.append((alias, cat, canonical))
+    return result
+
+
+_ALL_ALIASES: Optional[List[Tuple[str, str, str]]] = None
+
+
+def _get_aliases() -> List[Tuple[str, str, str]]:
+    global _ALL_ALIASES
+    if _ALL_ALIASES is None:
+        _ALL_ALIASES = _build_alias_list()
+    return _ALL_ALIASES
+
 
 # ---------------------------------------------------------------------------
 # SportsContext result dataclass
@@ -336,20 +389,88 @@ def _match_column(col: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _fuzzy_match_column(col: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fuzzy-match a column name against all known sports alias strings.
+
+    Uses difflib.SequenceMatcher to catch misspellings and non-standard
+    abbreviations that slip through exact synonym matching.  Only aliases
+    of length ≥ 4 are considered to avoid spurious short-token matches.
+
+    Returns (category, canonical_term) for the best match above
+    _FUZZY_THRESHOLD, or (None, None) if no close match found.
+    """
+    norm = _norm(col)
+    best_ratio = 0.0
+    best_cat: Optional[str] = None
+    best_canon: Optional[str] = None
+
+    for alias, cat, canonical in _get_aliases():
+        ratio = difflib.SequenceMatcher(None, norm, alias).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_cat = cat
+            best_canon = canonical
+
+    if best_ratio >= _FUZZY_THRESHOLD:
+        return best_cat, best_canon
+    return None, None
+
+
+def sample_categorical_values(df: pd.DataFrame, top_n: int = 15) -> List[str]:
+    """
+    Scan the top-N most frequent values of categorical columns for sports terms.
+
+    Catches sports datasets where column names are generic (e.g. "type", "category",
+    "status") but the values themselves reveal the domain ("goalkeeper", "tackle",
+    "hamstring").
+
+    Parameters
+    ----------
+    df     : DataFrame to scan (any columns; non-string columns are skipped).
+    top_n  : maximum number of distinct values to check per column.
+
+    Returns
+    -------
+    List of column names whose values contain at least one recognised sports term.
+    """
+    matched_cols: List[str] = []
+    for col in df.columns:
+        if not (df[col].dtype == object or str(df[col].dtype) == "category"):
+            continue
+        top_values = df[col].dropna().astype(str).value_counts().head(top_n).index
+        for val in top_values:
+            val_lower = val.lower().strip()
+            for term in _SPORTS_VALUE_TERMS:
+                if term in val_lower:
+                    matched_cols.append(col)
+                    break
+            else:
+                continue
+            break
+    return matched_cols
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def detect_sports_context(df: pd.DataFrame) -> SportsContext:
     """
-    Scan a DataFrame's column names and return a SportsContext describing which
-    columns appear to be sports-related and what role they play.
+    Scan a DataFrame's column names (and optionally categorical values) and
+    return a SportsContext describing which columns appear to be sports-related.
 
-    Uses synonym-group matching with abbreviation expansion and camelCase
-    normalisation — handles column naming conventions from StatsBomb, Wyscout,
-    Opta, NBA API, Sofascore, and other sports data providers.
+    Detection pipeline
+    ------------------
+    1. Exact synonym matching on normalised column names (full confidence weight).
+    2. Fuzzy column-name matching via difflib for misspellings / abbreviations
+       (half confidence weight).
+    3. Categorical value sampling — scans the top-N values of string columns
+       for sports domain terms such as position names or injury types
+       (half confidence weight).
 
-    Does NOT look at data values — only column names.
+    Handles naming conventions from StatsBomb, Wyscout, Opta, NBA API,
+    Sofascore, and other sports data providers.
 
     Parameters
     ----------
@@ -369,7 +490,10 @@ def detect_sports_context(df: pd.DataFrame) -> SportsContext:
         "workload_cols":     [],
     }
     matched_terms: List[str] = []
+    exact_matched: Set[str] = set()
+    weighted_sum = 0.0  # sum of per-column match weights for confidence
 
+    # --- Pass 1: exact synonym matching ---
     for col in df.columns:
         category, canonical = _match_column(col)
         if category is not None:
@@ -377,9 +501,38 @@ def detect_sports_context(df: pd.DataFrame) -> SportsContext:
             buckets[bucket].append(col)
             if canonical not in matched_terms:
                 matched_terms.append(canonical)
+            exact_matched.add(col)
+            weighted_sum += 1.0
 
-    n_matched = sum(len(v) for v in buckets.values())
-    confidence = n_matched / max(len(df.columns), 1)
+    # --- Pass 2: fuzzy column-name matching (for unmatched columns only) ---
+    fuzzy_matched: Set[str] = set()
+    for col in df.columns:
+        if col in exact_matched:
+            continue
+        category, canonical = _fuzzy_match_column(col)
+        if category is not None:
+            bucket = _CATEGORY_TO_BUCKET[category]
+            if col not in buckets[bucket]:
+                buckets[bucket].append(col)
+            if canonical not in matched_terms:
+                matched_terms.append(canonical)
+            fuzzy_matched.add(col)
+            weighted_sum += _FUZZY_WEIGHT
+
+    # --- Pass 3: categorical value sampling (for still-unmatched columns) ---
+    value_matched_cols = sample_categorical_values(df)
+    for col in value_matched_cols:
+        if col in exact_matched or col in fuzzy_matched:
+            continue
+        # Classify under "entity" (identity column) by default for value matches
+        bucket = "identity_cols"
+        if col not in buckets[bucket]:
+            buckets[bucket].append(col)
+        if "player" not in matched_terms:
+            matched_terms.append("player")
+        weighted_sum += _FUZZY_WEIGHT
+
+    confidence = weighted_sum / max(len(df.columns), 1)
 
     if confidence >= _SPORTS_THRESHOLD:
         detected_domain = "sports"

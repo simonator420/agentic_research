@@ -44,8 +44,10 @@ results/
 .AppleDouble
 ~$*
 
-# ── Proposal drafts (keep desc_revised.docx, exclude originals and temp) ──────
+# ── Proposal drafts / temp archives (keep revised versions only) ─────────────
 desc.docx
+desc_old.docx
+Archive.zip
 
 # ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/

@@ -232,14 +232,16 @@ def _evaluate_single(
         else:  # REGRESSION
             rmse = float(np.sqrt(mean_squared_error(y_val, y_pred)))
             r2   = float(r2_score(y_val, y_pred))
-            # Negate RMSE so that higher = better (consistent with other metrics)
-            fold_primaries.append(-rmse)
+            # R² is the primary metric for regression: higher = better, range ≈ [0, 1].
+            # It is listed first in fold_metrics so that evaluate_plans() picks it up
+            # as `primary` via next(iter(metric_values.values())).
+            fold_primaries.append(r2)
+            fold_metrics.setdefault("r2", []).append(r2)
             fold_metrics.setdefault("rmse", []).append(rmse)
             fold_metrics.setdefault("mae", []).append(
                 float(mean_absolute_error(y_val, y_pred)))
             fold_metrics.setdefault("median_ae", []).append(
                 float(median_absolute_error(y_val, y_pred)))
-            fold_metrics.setdefault("r2", []).append(r2)
             fold_metrics.setdefault("explained_variance", []).append(
                 float(explained_variance_score(y_val, y_pred)))
             # MAPE — guard against zero targets
@@ -251,9 +253,11 @@ def _evaluate_single(
     runtime_secs = time.perf_counter() - t_start
     cv_std = float(np.std(fold_primaries))
 
-    # Average each metric across folds; skip NaN folds (e.g. AUC on degenerate data)
+    # Average each metric across folds; skip NaN folds (e.g. AUC on degenerate data).
+    # Guard against empty lists (can occur when every fold skipped a metric).
     averaged = {
-        k: float(np.nanmean(v)) for k, v in fold_metrics.items()
+        k: float(np.nanmean(v)) if v else float("nan")
+        for k, v in fold_metrics.items()
     }
 
     return averaged, cv_std, runtime_secs
@@ -292,7 +296,9 @@ def evaluate_plans(
             pipeline = build_pipeline(plan, profile, X)
             metric_values, cv_std, runtime_secs = _evaluate_single(pipeline, X, y, profile, cv)
 
-            # Primary metric is the first key in metric_values (f1, f1_macro, or -rmse)
+            # Primary metric is the first key in metric_values:
+            #   classification → f1_macro  (higher = better)
+            #   regression     → r2        (higher = better, moved to first position)
             primary = next(iter(metric_values.values()))
             n_steps = _count_steps(pipeline)
             score = _composite_score(primary, cv_std, n_steps)
@@ -460,6 +466,52 @@ def generate_visualisations(
             fig.savefig(path, dpi=100, bbox_inches="tight")
             plt.close(fig)
             saved.append(path)
+    except Exception:
+        pass
+
+    # --- 3b. ROC curve (binary classification only) ---
+    try:
+        if profile.target_type == TargetType.BINARY:
+            from sklearn.model_selection import cross_val_predict
+            y_prob_all = cross_val_predict(best_pipeline, X, y, cv=3, method="predict_proba")[:, 1]
+            from sklearn.metrics import RocCurveDisplay
+            fig, ax = plt.subplots(figsize=(6, 5))
+            RocCurveDisplay.from_predictions(y, y_prob_all, ax=ax, name="CV predictions (3-fold)")
+            ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random classifier")
+            ax.set_title("ROC Curve (3-fold CV)")
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            path = os.path.join(output_dir, "roc_curve.png")
+            fig.savefig(path, dpi=100, bbox_inches="tight")
+            plt.close(fig)
+            saved.append(path)
+    except Exception:
+        pass
+
+    # --- 3c. Per-fold CV performance ---
+    try:
+        from sklearn.model_selection import cross_val_score
+        if profile.target_type == TargetType.REGRESSION:
+            scores = cross_val_score(best_pipeline, X, y, cv=5, scoring="r2")
+            metric_name = "R²"
+        else:
+            scores = cross_val_score(best_pipeline, X, y, cv=5, scoring="f1_macro")
+            metric_name = "F1 macro"
+        fig, ax = plt.subplots(figsize=(7, 4))
+        folds = [f"Fold {i+1}" for i in range(len(scores))]
+        colors = ["#e04040" if s < scores.mean() else "#4a9fd4" for s in scores]
+        ax.bar(folds, scores, color=colors, alpha=0.85)
+        ax.axhline(scores.mean(), color="#333333", linestyle="--", lw=1.5,
+                   label=f"Mean {metric_name}: {scores.mean():.4f} ± {scores.std():.4f}")
+        ax.set_ylabel(metric_name)
+        ax.set_title(f"Per-fold {metric_name} (5-fold CV) — Best Pipeline")
+        ax.legend(fontsize=8)
+        ax.set_ylim(0, max(1.0, scores.max() * 1.1))
+        plt.tight_layout()
+        path = os.path.join(output_dir, "per_fold_performance.png")
+        fig.savefig(path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(path)
     except Exception:
         pass
 
@@ -663,3 +715,257 @@ def build_user_report(
         "*End of report.*",
     ]
     return "\n".join(lines)
+
+
+def build_exploratory_report(
+    profile: DataProfile,
+    issues: List[Issue],
+    goal_text: str = "",
+    visualisation_paths: List[str] = None,
+) -> str:
+    """
+    Build a plain-language exploratory analysis report (no ML model trained).
+
+    Used when the user's goal is to discover patterns, natural groupings, or
+    trends rather than to build a predictive model.
+
+    Parameters
+    ----------
+    profile              : DataProfile (target_column=None).
+    issues               : Severity-sorted issue list from detect_issues().
+    goal_text            : The user's original natural-language goal.
+    visualisation_paths  : Paths to generated PNG files.
+
+    Returns
+    -------
+    Markdown-formatted report string.
+    """
+    import os
+
+    lines = [
+        "# Agentic Sports Analytics — Exploratory Analysis Report",
+        "",
+        "> *Generated automatically by the Agentic Sports Analytics System.*",
+        "> *This report is designed for coaches, analysts, and scouts — "
+        "no machine learning background required.*",
+        "",
+    ]
+
+    if goal_text:
+        lines += [
+            f"> **Your goal:** *{goal_text.strip()}*",
+            "",
+        ]
+
+    # --- Dataset overview ---
+    lines += [
+        "## 1. Dataset Overview",
+        "",
+        f"| Property | Value |",
+        f"|----------|-------|",
+        f"| Rows | {profile.n_rows:,} |",
+        f"| Columns | {profile.n_cols} |",
+        f"| Duplicate rows | {profile.n_duplicates} |",
+        "",
+    ]
+
+    sc = getattr(profile, "sports_context", None)
+    if sc and sc.is_sports:
+        terms = ", ".join(sc.matched_terms[:8])
+        lines += [
+            f"> **Sports dataset detected** (confidence {sc.confidence:.0%}) — "
+            f"matched terms: {terms}",
+            "",
+        ]
+
+    # --- Data quality ---
+    high   = [i for i in issues if i.severity == IssueSeverity.HIGH]
+    medium = [i for i in issues if i.severity == IssueSeverity.MEDIUM]
+    lines += [
+        "## 2. Data Quality",
+        "",
+        f"The system found **{len(issues)} data quality issues** "
+        f"({len(high)} high-severity, {len(medium)} medium-severity).",
+        "",
+    ]
+    if high:
+        lines.append("**High-severity issues (require attention):**")
+        for iss in high:
+            lines.append(f"- {iss.description}")
+        lines.append("")
+    if medium:
+        lines.append("**Medium-severity issues:**")
+        for iss in medium:
+            lines.append(f"- {iss.description}")
+        lines.append("")
+    if not issues:
+        lines += ["No significant data quality issues detected.", ""]
+
+    # --- Cluster patterns ---
+    if profile.clusters and profile.clusters.cluster_summaries:
+        cl = profile.clusters
+        lines += [
+            "## 3. Natural Groupings in the Data",
+            "",
+            f"The system identified **{cl.n_clusters} natural groups** using "
+            f"unsupervised clustering "
+            f"(silhouette score: {cl.silhouette_score:.3f} — higher is better separation; "
+            f"Davies–Bouldin index: {cl.davies_bouldin_index:.3f} — lower is better).",
+            "",
+            "**What each group looks like:**",
+            "",
+        ]
+        for cid, summary in cl.cluster_summaries.items():
+            lines.append(f"- {summary}")
+        lines += [
+            "",
+            "> These groupings were discovered automatically. "
+            "They may correspond to player archetypes, match intensity levels, "
+            "injury-risk profiles, or other domain-relevant patterns.",
+            "",
+        ]
+    else:
+        lines += [
+            "## 3. Natural Groupings",
+            "",
+            "The dataset did not yield clear natural clusters "
+            "(too few numeric columns or observations).",
+            "",
+        ]
+
+    # --- Sports columns detected ---
+    if sc and sc.is_sports:
+        lines += ["## 4. Sports Domain Columns Detected", ""]
+        if sc.post_match_cols:
+            lines.append(
+                f"**Post-match statistics** *(potential leakage for outcome prediction)*: "
+                f"{', '.join(f'`{c}`' for c in sc.post_match_cols)}"
+            )
+        if sc.identity_cols:
+            lines.append(
+                f"**Identity columns** *(player/team identifiers — not model features)*: "
+                f"{', '.join(f'`{c}`' for c in sc.identity_cols)}"
+            )
+        if sc.injury_cols:
+            lines.append(
+                f"**Injury / wellness columns**: "
+                f"{', '.join(f'`{c}`' for c in sc.injury_cols)}"
+            )
+        if sc.workload_cols:
+            lines.append(
+                f"**Workload metrics**: "
+                f"{', '.join(f'`{c}`' for c in sc.workload_cols)}"
+            )
+        lines.append("")
+
+    # --- Visualisations ---
+    if visualisation_paths:
+        lines += [
+            "## 5. Visualisations",
+            "",
+            "The following figures have been saved:",
+            "",
+        ]
+        for p in (visualisation_paths or []):
+            lines.append(f"- `{os.path.basename(p)}`")
+        lines.append("")
+
+    lines += [
+        "---",
+        "> **Next step:** if you would like to build a predictive model, "
+        "describe what you want to predict and re-run the pipeline in predictive mode.",
+        "",
+        "*End of exploratory report.*",
+    ]
+    return "\n".join(lines)
+
+
+def generate_exploratory_visualisations(
+    profile: DataProfile,
+    X: pd.DataFrame,
+    output_dir: str = "figures",
+) -> List[str]:
+    """
+    Generate visualisations for an exploratory (no-model) run.
+
+    Produces:
+      1. Missing data bar chart (if any missingness exists).
+      2. PCA cluster projection (if clusters were discovered).
+
+    Returns list of saved file paths.
+    """
+    import os
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return []
+
+    os.makedirs(output_dir, exist_ok=True)
+    saved: List[str] = []
+
+    # --- Missingness ---
+    try:
+        missing_items = [
+            (c, col.missing_rate)
+            for c, col in profile.columns.items()
+            if col.missing_rate > 0
+        ]
+        if missing_items:
+            cols_m, rates_m = zip(*missing_items)
+            fig, ax = plt.subplots(figsize=(10, max(3, len(cols_m) * 0.35)))
+            ax.barh(list(cols_m), list(rates_m), color="#4a9fd4")
+            ax.axvline(x=0.30, color="crimson", linestyle="--", alpha=0.8,
+                       label="High-missingness threshold (30%)")
+            ax.set_xlabel("Missing value rate")
+            ax.set_title("Missing Data by Column")
+            ax.set_xlim(0, 1)
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            path = os.path.join(output_dir, "missingness.png")
+            fig.savefig(path, dpi=100, bbox_inches="tight")
+            plt.close(fig)
+            saved.append(path)
+    except Exception:
+        pass
+
+    # --- PCA cluster projection ---
+    try:
+        clusters = profile.clusters
+        if clusters is not None and clusters.n_clusters > 1 and clusters.cluster_summaries:
+            import numpy as np
+            from sklearn.decomposition import PCA
+
+            valid_X = X.loc[clusters.valid_indices, clusters.numeric_columns]
+            valid_X = valid_X.fillna(valid_X.mean())
+            pca = PCA(n_components=2, random_state=42)
+            coords = pca.fit_transform(valid_X)
+            labels_arr = np.array(clusters.labels)
+
+            fig, ax = plt.subplots(figsize=(8, 6))
+            sc = ax.scatter(coords[:, 0], coords[:, 1],
+                            c=labels_arr, cmap="tab10", alpha=0.7, s=30)
+            plt.colorbar(sc, ax=ax, label="Cluster ID")
+            ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%} var.)")
+            ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%} var.)")
+            ax.set_title(
+                f"Natural Groupings — {clusters.n_clusters} Clusters (PCA projection)"
+            )
+            for cid in range(clusters.n_clusters):
+                mask = labels_arr == cid
+                cx, cy = coords[mask, 0].mean(), coords[mask, 1].mean()
+                ax.annotate(
+                    f"C{cid}", (cx, cy),
+                    fontsize=10, fontweight="bold", ha="center",
+                    bbox={"boxstyle": "round,pad=0.2", "fc": "white", "alpha": 0.7},
+                )
+            plt.tight_layout()
+            path = os.path.join(output_dir, "cluster_projection.png")
+            fig.savefig(path, dpi=100, bbox_inches="tight")
+            plt.close(fig)
+            saved.append(path)
+    except Exception:
+        pass
+
+    return saved

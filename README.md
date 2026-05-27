@@ -53,7 +53,32 @@ streamlit run app.py
 
 The browser opens at `http://localhost:8501`. Upload any CSV, pick the target column, answer the clarification questions, and click **Run Agentic Pipeline**.
 
-### 4. Or use the notebook
+### 4. Or run locally from the terminal
+
+You can run the same pipeline without Streamlit:
+
+```bash
+python run_local.py data/titanic.csv \
+  --goal "Predict whether a passenger survived" \
+  --target Survived
+```
+
+The full agentic predictive pipeline requires `ANTHROPIC_API_KEY`. For a local
+no-LLM smoke test, use one of the baselines:
+
+```bash
+python run_local.py data/titanic.csv --target Survived --baseline rule
+```
+
+Exploratory analysis does not require a target column:
+
+```bash
+python run_local.py data/titanic.csv \
+  --mode exploratory \
+  --goal "Find natural groups in the data"
+```
+
+### 5. Or use the notebook
 
 ```bash
 jupyter notebook experiments.ipynb
