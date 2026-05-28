@@ -58,24 +58,24 @@ The browser opens at `http://localhost:8501`. Upload any CSV, pick the target co
 You can run the same pipeline without Streamlit:
 
 ```bash
-python run_local.py data/titanic.csv \
-  --goal "Predict whether a passenger survived" \
-  --target Survived
+python run_local.py data/shot_logs.csv \
+  --goal "Predict whether a shot will be made" \
+  --target shot_made_flag
 ```
 
 The full agentic predictive pipeline requires `ANTHROPIC_API_KEY`. For a local
 no-LLM smoke test, use one of the baselines:
 
 ```bash
-python run_local.py data/titanic.csv --target Survived --baseline rule
+python run_local.py data/shot_logs.csv --target shot_made_flag --baseline rule
 ```
 
 Exploratory analysis does not require a target column:
 
 ```bash
-python run_local.py data/titanic.csv \
+python run_local.py data/shot_logs.csv \
   --mode exploratory \
-  --goal "Find natural groups in the data"
+  --goal "Find natural shooting archetypes among NBA players"
 ```
 
 ### 5. Or use the notebook
@@ -84,7 +84,7 @@ python run_local.py data/titanic.csv \
 jupyter notebook experiments.ipynb
 ```
 
-Run cells top to bottom. The demo uses `data/titanic.csv`. For real sports data, change `DATA_PATH` and `TARGET` in cell 4.
+Run cells top to bottom. Change `DATA_PATH` and `TARGET` in cell 4 to match your dataset.
 
 ---
 
@@ -110,7 +110,7 @@ agentic_research/
 ├── .env                           ← API key (NOT committed — create this yourself)
 │
 ├── data/
-│   └── titanic.csv                ← demo dataset (60 KB)
+│   └── shot_logs.csv              ← demo dataset: NBA shot logs (16 MB)
 │
 ├── storage/                       ← auto-created at runtime
 │   ├── runs.db                    ← SQLite: within-run attempt history
@@ -262,7 +262,7 @@ Used by all variants for direct comparison:
 score = primary_metric − 0.5 × cv_std − 0.01 × n_pipeline_steps
 ```
 
-- `primary_metric`: F1 (classification) or −RMSE (regression) — higher is always better
+- `primary_metric`: F1 (classification) or R² (regression) — higher is always better
 - `cv_std`: standard deviation across folds (penalises instability)
 - `n_pipeline_steps`: number of Pipeline steps (penalises unnecessary complexity)
 
